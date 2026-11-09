@@ -1,0 +1,1561 @@
+# Preloader: Comprehensive Improvement Roadmap
+
+**Status of the current codebase:** ~35k LOC, 60+ C++ translation units, 48 host tests, 22 documented items, several known-correct seams. The **architecture is sound** (fail-closed, host-tested pure modules, register-aware passthrough detours, probe-backed rules, per-feature diagnostics). What isn't sound is: **the hot paths** (per-call allocations, per-call `/proc` reads, blocking locks on the render thread, a **data race** on the cosmetic frame buffer, a **1MB-per-call allocation** on the JNI UI surface, an **accidental `strstr`** in two camera scans that the codebase's own `ModulePathMatch.hpp` exists to prevent), the **mod loader** (no hot reload, no parallel load, no signature verification, no per-mod fault persistence, linear keybind scan on every key event), and the **signature scanner** (single-threaded, per-window `process_vm_readv`, re-reading the ELF header + maps every resolve, no negative cache, no cache sharding).
+
+This document lists ~180 concrete improvements, ordered by category, with enough specificity to be turned directly into tickets. It deliberately goes past "known safe" into "ambitious but achievable" — the goal is *the best* preloader, not a slightly-better one.
+
+Where an item says **BUG**, it's a real correctness defect in the shipped code, not a style preference.
+
+---
+
+## Table of contents
+
+1. **Critical correctness bugs (fix first)**
+2. **Hot-path latency & allocations**
+3. **Threading, locks, and the render path**
+4. **Signature scanning & vtable resolution**
+5. **Hook subsystem**
+6. **Mod loader**
+7. **Cosmetics pipeline & image hook**
+8. **Camera / render context**
+9. **JNI surfaces**
+10. **Logging, diagnostics, feature availability**
+11. **Input bridge**
+12. **Resource-loader / AntEgg**
+13. **Pure modules (parsers, solvers, matrix, snapshot)**
+14. **Native API surface for mods**
+15. **Build, toolchain, packaging**
+16. **Testing & CI**
+17. **Security & isolation**
+18. **Observability & crash reporting**
+19. **New capabilities (roadmap)**
+20. **Priority matrix**
+
+---
+
+## 1. Critical correctness bugs (fix first)
+
+These are real defects visible in the source you provided. Fix before touching anything else.
+
+### 1.1 **BUG** Data race on `g_framePublished` in `GameCosmetics.cpp`
+
+`CosmeticFrameSnapshot()` reads `g_framePublished` **without the `g_mutex`**, while `SetCosmeticFrame()` mutates it (`.swap()`) **under the mutex**. `std::vector::swap` mutates both buffers' internal pointers; a concurrent `out = g_framePublished` copy is a data race (UB; on ARM64 can observe a torn pointer pair and abort or corrupt).
+
+**Fix:** publish an immutable `shared_ptr<const std::vector<uint8_t>>` behind `std::atomic_load`/`atomic_store` (same pattern as `CallbackSnapshot.hpp` and `ImageOverrideRegistry`). The render thread takes one atomic load and holds a stable view; the writer swaps a whole new buffer in. This also removes the copy of the whole frame (`out = g_framePublished`) on the render thread and lets the reader hold a `const&` if it wishes.
+
+### 1.2 **BUG** `SetCosmeticFrame` copies up to 1KB+ under `g_mutex` on the hot path
+
+Called every launcher tick. Should be:
+1. Build the new buffer **off-lock** (caller owns it).
+2. Swap into a published `shared_ptr` behind an atomic store.
+
+### 1.3 **BUG** `strstr(line, moduleName)` in `CameraSource.cpp` and `NativeCosmeticContext.cpp`
+
+Both files scan `/proc/self/maps` with `strstr` for the module name — **the exact bug** the codebase's own `ModulePathMatch.hpp` was written to eliminate. `libminecraftpe.so` will also match `libminecraftpe.so.bak`, a directory segment, or a tag `[anon:libminecraftpe.so]` (which actually happens for JIT regions). This can select the wrong regions and scan megabytes of unrelated memory.
+
+**Fix:** use `pl::memory::ParseMapsLine` + `MapsPathNamesModule` (already there, host-tested). Also filter by `MapsPermsReadable`.
+
+### 1.4 **BUG** `CameraSource::ResolveOnce()` scans *all writable* `/proc` regions of the game process
+
+Called synchronously from `InitNativeCosmeticRenderHook()` which runs on the **frame thread** during `InitGameHooks()`. On a device with 500 MB–2 GB of writable game memory (JIT caches, allocator arenas, texture pool), this is potentially **seconds of stall on the render thread**. Same for the pattern scan in `NativeCosmeticContext.cpp`.
+
+**Fix:**
+1. Move to a worker thread (`std::thread` / `std::async`) started from `InitGameHooks` that publishes a `hasAddress` atomic; the render path uses whatever is available.
+2. Scan **only** regions whose path is the game module (not every writable mapping).
+3. Chunk the scan and yield (`std::this_thread::yield()`) every ~64MB, or use `process_vm_readv` into a small window with an atomic progress marker so the render thread can cancel.
+4. Stop the scan early on the first plausible match at moderate confidence; use higher-confidence validation on the result. The current `ValidateProjection` accepts `m[0] ∈ [0.5,6]` and `m[11] ≈ -1` — that's not selective enough to stop at the first hit.
+
+### 1.5 **BUG** `nativeReadCapturedSkin` / `nativeReadCapturedCape` allocate ~2MB per call
+
+`GameCosmeticsJni.cpp` allocates a 1MB `std::vector<uint8_t>` + a 1MB+16 output vector **on every JNI call**. If the launcher polls at 1Hz this is 2 MB/s of alloc/free; at 10 Hz it's 20 MB/s. On a memory-constrained device this is a serious GC pressure + page-fault cost.
+
+**Fix:**
+1. Add `nativeCapturedSkinSize()` returning `{width, height, format, stampMs, sizeBytes}` without any copy (one atomic load of the size).
+2. Make `nativeReadCapturedSkin(byte[] into)` take a caller-provided array (or return null when size doesn't match), so the caller can reuse a buffer.
+3. Alternatively return the payload via a `DirectByteBuffer` pointing into a pre-allocated buffer inside `CapturedImageSlot` (double-buffered to avoid a race with the next capture), with a documented "valid until next capture" contract. **Zero copy.**
+4. Same for cape.
+
+### 1.6 **BUG** `RenderGeometryData` and `CosmeticFrameData` copy the full blob under `g_mutex`
+
+Same fix as 1.1/1.2: publish a `shared_ptr<const std::vector<uint8_t>>` and let the reader hold it.
+
+### 1.7 **BUG** `ReadConfiguredOptifineSlot` reparses the rules JSON file on *every call*
+
+Called from `InitCosmeticsHooks` three times (skin/ texture/packet) and from `InstallTier2CountingHook` once per tier-2 item. Each call reopens and reparses a JSON file. `InitGameHooks` calls it multiple times.
+
+**Fix:** parse rules once into an in-memory struct (`MergedRules`), cache it behind a shared mutex keyed on the file's mtime + path. Add a `ReloadRules()` when the launcher updates the file. This alone removes six file reads and parses from a single install.
+
+### 1.8 **BUG** `DobbyHookManager::openModule` caches `GHandle`s forever with no eviction / close
+
+One GHandle per distinct module resolved. `GlossClose` is never called. Documented as intentional (mods are permanent) but on a long session that reloads mods (hot reload — see §6) or a heavily-modded install this is an unbounded leak. Add a `closeUnusedHandles()` that closes handles not touched in `N` sessions, called from `OnTrimMemory` or a periodic timer.
+
+### 1.9 **BUG** `PlayerSnapshot::read` retries 8 times then returns `false` (indistinguishable from "no player")
+
+Under high contention (`publish` at 60Hz from the game thread, `read` from UI at 60Hz), the retry budget is occasionally exceeded and callers see "no data". While it's better than the old "return false on any window", the API cannot distinguish "the writer is too fast" from "nothing was published". Add a return enum: `ReadResult::Ok | ReadResult::NotPublished | ReadResult::Contended`, and let callers fall back to the last known transform on `Contended`. Same for `SnapshotChannel::read`.
+
+### 1.10 **BUG** `GameHookRules::LoadConfiguredGameHookSignatures` sets `g_rulesLoadAttempted=true` before the file is read
+
+If `ReadTextFile` fails, `g_rulesLoadAttempted` is `true` (correct — an attempt was made) but `g_rulesPath` is whatever the last `ConfigureGameHookRules` set. The `GameHookRulesConfigured()` check is on `!g_rulesPath.empty()`, which may be true even though the file is missing. A retry mechanism then re-tries reading a nonexistent file forever. No retry is implemented, but the diagnostic says "load attempted" and "rules configured" simultaneously, which is confusing. Distinguish `Configured` (path supplied) from `Loaded` (file read + parsed).
+
+### 1.11 **BUG** `InitCosmeticsHooks` is called inside `InitGameHooks` before `InitPlayerRenderSource`
+
+Actually the order in `InitGameHooks` is:
+```
+InitLocalPlayerSource();
+signatures = LoadConfiguredGameHookSignatures();
+InitPlayerRenderSource(...);
+InstallSwapFrameBoundary();
+InitNativeCosmeticRenderHook(...);
+InitCosmeticsHooks(0,0,0);
+```
+`InitCosmeticsHooks` calls `InitMceImageHook` which calls `ResolveLoader()` → `ImageLoaderAddress()` → `LoadConfiguredGameHookSignatures()` **again**. Another file read. Fix with 1.7.
+
+### 1.12 **BUG** `HookInstallGate::tick` decrements to a resolved state on the first frame
+
+`kMinFrameTicks = 1`, so the very first frame tick after `ArmGameHookInstall` runs the install. But `ArmGameHookInstall` is called from `onCreate` — before `libminecraftpe.so` may be fully mapped. The gate has `kGiveUpMs = 30000` but that's only checked *after* `kMinFrameTicks`, and since `kMinFrameTicks=1` it never fires. So the gate always installs on the very first frame.
+
+**Fix:** require *both* `kMinFrameTicks` (raise to 3–5) *and* a runtime-up probe (`IsPlayerRenderHookTargetResolvable()` or a "first frame rendered" signal from `eglSwapBuffers`).
+
+### 1.13 **BUG** `GameLocalPlayer::ReadSnapshot` reads `MonotonicMs()` and then compares — but the 2000ms freshness window means a "player" is reported for **2 seconds after teardown**
+
+`ReadLocalPlayerPosition` returns stale data after the game tears down. `kSnapshotFreshMs = 2000` means after `getLocalPlayer` stops being called, the last snapshot is still "fresh". Better: publish a `publishedMs` via the write path *and* a `teardownMs` timestamp when the world unloads (hook the world unload path or use the swap-buffer hook to detect a 500ms gap). A single monotonic global for "game is alive" (updated on every `eglSwapBuffers`) is enough to know a teardown happened.
+
+### 1.14 **BUG** `Map`-based deduplication in `NativeCosmeticContext` / `CameraSource` — see 1.3
+
+### 1.15 `MemoryRegionInfo::describe()` calls `std::snprintf` — used in log lines, which already go through `fmt`. Minor, but every `hook()` call logs a `describe()` that does its own `snprintf`. Use `fmt::format_to` or a pre-sized string.
+
+---
+
+## 2. Hot-path latency & allocations
+
+These are called on the render thread, the game thread, or the input path — every occurrence of a `malloc` here is a potential frame drop or input lag spike.
+
+### 2.1 `HookRender` — per-render-call allocations
+
+`HookRender` (in `GamePlayerRender.cpp`) runs **once per rendered player model**. When 10 players are visible, that's 10 calls per frame. On each call it:
+- Calls `MonotonicUs()` → `clock_gettime` (syscall) — could be `rdtsc`-cached per frame.
+- Calls `MonotonicMs()` (another `clock_gettime`) — **redundant**, `nowUs/1000` already exists.
+- Publishes the snapshot to `SnapshotChannel` which does a seqlock write (fine) — but the snapshot content is `{tick, callsThisFrame, totalCalls, nowMs}` — the *last field* is now redundant with `nowUs`.
+
+**Fix:** call `clock_gettime` once; derive `nowMs` from `nowUs`. Consider `std::chrono::steady_clock::now()` which is inlined to `clock_gettime(CLOCK_MONOTONIC)` but if the compiler can hoist... no, it can't. Use `__builtin_ia32_rdtsc` on x86 or `mrs cntvct_el0` on ARM (needs `cntvct_el0` read — this is a `MRS` which is fast and user-readable).
+
+### 2.2 `HookRender` calls `DispatchRenderCallbacks()` on **every** render call, not once per frame
+
+`DispatchRenderCallbacks` (in `RenderApi.cpp`) builds a full `RenderContext` and invokes every callback. For 10 visible players, that's 10× the callback work per frame. `DispatchRenderCallbacks` is documented as "once per rendered frame" but is actually called per model.
+
+**Fix:** `HookRender` should call `DispatchRenderCallbacks()` only when `g_renderTick` changed (i.e., on the first model of a frame). The tick counter already exists — use it.
+
+### 2.3 `FramePacingAnalyzer::percentiles()` copies and sorts 2000 samples on **every call**
+
+Called from `nativeReadFramePacingPercentiles`. If the launcher polls at 60Hz this is 120k sorts/sec. If it polls occasionally, fine — but there's no guard. Add a "sample generation" counter; if unchanged, return the last computed reading. Or maintain running percentiles via a bounded-heap. Or use a 5-second rate-limited computation.
+
+### 2.4 `FramePacingAnalyzer::onFrame` runs on every render call
+
+The pacing analysis is per-model-draw, but the `onFrame` call has a `minIntervalUs = 3000` guard that discards intervals <3ms. So the sampling rate is once per real frame. Good. But the `minIntervalUs = 3000` still triggers on every render call (cheap).
+
+However: `onFrame` sets `percentileRing_[slot] = interval` and `percentileStamp_[slot] = nowUs` **every render call**? Let me re-read... yes it does, but only when `interval >= minIntervalUs`, so only once per frame. Good.
+
+But: `percentileSpanUs_` is loaded on every render call → atomic load. Minor.
+
+### 2.5 `CallbackSnapshot::forEach` — fine for input (rare dispatch), but is used by `RenderApi` too
+
+`DispatchRenderCallbacks` iterates `g_callbacks` (a `CallbackSnapshot<RenderCallback>`). `forEach` copies... no, `forEach` gets a `shared_ptr` once and iterates by const ref. Good.
+
+But the return value is discarded (`forEach` doesn't return whether any callback consumed). For render it's fine.
+
+### 2.6 `InputBridge::DispatchTextInput` copies the string into `pl::input::TextInputEvent`
+
+For every text input event, the text is copied into `event{.text = std::string(text)}`. Then each C++ callback receives a *copy* of the event (it's by value). For a 10KB pasted text, that's 10 copies. Use `std::shared_ptr<const std::string>` or `std::string_view` in the callback signature.
+
+**Fix:** change `TextInputCallback` to `std::function<bool(const TextInputEvent&)>` (currently it IS by const ref? Let me check... yes it is, but `event` itself is a temporary and holds a copy). Use a single string and pass `string_view` per callback:
+```cpp
+const pl::input::TextInputEvent event{.text = std::string(text)};
+g_cppTextInputCallbacks.forEach([&](const auto& cb) { cb(event); });
+```
+That's one copy total, not one per callback. But if callbacks want to keep the string they'd need to copy. Document this.
+
+### 2.7 `ModMenuBridge::DispatchRegisteredButtonEvent` — fine
+
+`CallbackSnapshot` is used via `ScopedModMenuOwner`... wait no, button events use `std::function` stored on the button struct, accessed under `g_modMenuMutex`. That's a mutex per event — fine for button presses (rare).
+
+### 2.8 `Logger::log` — `fmt::vformat` allocates on every call
+
+`__android_log_print` also allocates/copies internally. For an INFO-level line at 60Hz (e.g. `HookRender` logs nothing, good), this would be catastrophic. It's currently avoided by level check, but there's **no way to disable INFO at compile time for release**. Add:
+
+```cpp
+#ifndef PRELOADER_MIN_LOG_LEVEL
+#define PRELOADER_MIN_LOG_LEVEL ANDROID_LOG_DEBUG
+#endif
+```
+and compile INFO out in release builds.
+
+More importantly: **`fmt::vformat` is used for every emitted line**, even for simple constants. Add overloads:
+```cpp
+void info(std::string_view literal) const;  // skips vformat
+```
+Many `info("...")` call sites in the code are literals or trivial concat.
+
+### 2.9 `HookSelfTest::RoundTrip` calls `pl::memory::hook` twice per site on the install path
+
+The self-test round-trips every hook site during `InitGameHooks` — that's `2 * N` `GlossHook` calls (install + delete), each of which is a `mprotect` + code patch + `icache flush`. For 7 sites that's ~14 `mprotect` syscalls. Each can be 10–100µs on Android. On a slow device, adding 1–2ms to install.
+
+**Fix:** make the self-test **opt-in via a diagnostic flag**, not run automatically on install. Or run it after the real install on a worker thread, so the game has already started. Or run only the control (private stubs) + the sites the game hasn't called yet. The current implementation delays the install path.
+
+### 2.10 `CameraSource::ReadFrame` — revalidates projection and view every frame
+
+The current implementation calls `ValidateView(view)` and `ValidateProjection(projection)` every frame — that's ~40 float comparisons per frame per consumer. Not huge, but the validation also reads 32 floats from possibly-different memory regions. Fine, but the revalidation exists only to guard against "the address was freed" — an extremely unlikely event if the address was found in a writable region. Consider: verify only on a slow cadence (every N frames), or on a "changed" signal from the game (e.g. a swap-buffer counter change).
+
+### 2.11 `GameCosmetics::SetRenderGeometry` computes FNV hash under `g_mutex`
+
+Move the hash computation off-lock (compute before acquiring the mutex).
+
+### 2.12 `GameCosmetics::SetPieceAtlas` — 1MB+ copy under `g_mutex`
+
+Same pattern. Move the copy + vector fill before the lock.
+
+### 2.13 `GameCosmetics::SetCapeOverride` / `SetTextureOverride` — same
+
+### 2.14 `SetContentSubstitution` — same
+
+### 2.15 `AntEggLoader::Extract` — `fs::weakly_canonical` per entry
+
+For an archive with 100 entries, that's 100 `realpath` syscalls, each ~10µs. Also `fs::exists` + `fs::is_regular_file` per entry. On a slow filesystem (FUSE in some app sandboxes), this is seconds. 
+
+**Fix:** validate the entire entry list up-front by joining and checking the normalized paths lexically (no syscalls), then extract. Only use `weakly_canonical` for the sandbox root (once).
+
+### 2.16 `AntEggLoader` `ReadWholeFile` reads up to 512MB into memory
+
+Use `mmap(PROT_READ, MAP_PRIVATE)` and let the ZIP parser walk the mapped file. `zlib`'s `inflate` operates on a byte pointer, so this is a one-line change to the read path. Avoids the double-copy (read → vector → parse).
+
+### 2.17 `CameraSource` — falls back to `ComputeViewProjection` per frame
+
+`ComputeViewProjection` does 4×4 matrix multiplies + trig per frame. In the fallback path it's called every frame per consumer. Fine, but for multiple consumers (cosmetics + a mod), each does its own. Cache per-frame in `RenderContext`.
+
+### 2.18 `ModMenuBridge::RegisterKeyCallbackIfNeeded` — linear scan on every key event
+
+`g_registeredModules` × `mod.configs` × comparing `stoi(current_value)` per key event. With 20 modules each with 10 configs, that's 200 scans per key event. And `stoi` can throw, so the `try/catch` on every candidate is expensive.
+
+**Fix:** maintain an inverted `std::unordered_map<int, std::vector<KeybindRegistration>>` indexed by keyCode. Update on registration / config change. Then per key event it's one hash lookup.
+
+### 2.19 `ModMenuBridge::GetDrawCommands` — three copies per frame
+
+`g_registeredModules` → `out` vector → JNI arrays. The JNI layer also allocates 8 arrays per call. If HUD polls at 60Hz this is significant. Cache the draw command list behind a revision counter (already exists: `g_drawCommandsRevision`). JNI can accept a "since revision N" argument and only rebuild the arrays when the revision changes.
+
+### 2.20 `BerryApi::nativeReplayInfo` / `nativeReplayPlayback` — allocate per call
+
+These are tiny (8 or 5 jlong). Fine. But `nativeReplayStatus` returns `env->NewStringUTF` which allocates a Java string. Cache the last status string, invalidate on state change.
+
+### 2.21 `GameLocalPlayer` — double `MonotonicMs()` call per read
+
+`ReadSnapshot` calls `MonotonicMs()` (a syscall) once per call. `ReadLocalPlayerPosition` and `ReadLocalPlayerRotation` each call `ReadSnapshot` — so two `clock_gettime` per frame if both are read. Add `ReadLocalPlayerSnapshot(float outPos[3], float outRot[2], long long* stampMs)` that does one read. Update call sites.
+
+---
+
+## 3. Threading, locks, and the render path
+
+### 3.1 `HookRender` acquires no lock — good. But `RegisterPostRenderCallback` is called from install path, and reads `g_postRenderCount` without lock. That's fine (atomic).
+
+### 3.2 `FramePacingAnalyzer::percentiles()` serializes readers via `scratchMutex_`
+
+If two diagnostics pages poll at once, they contend. Use `thread_local` scratch buffer — no lock, no contention:
+```cpp
+static thread_local std::array<long long, kPercentileWindow> scratch;
+```
+
+### 3.3 `DobbyHookManager::handleMutex` serializes `openModule` (which calls `GlossOpen` — a potentially slow `dlopen` path)
+
+Not on hot path, but if two hooks install in parallel (they don't today), they'd serialize. Fine.
+
+### 3.4 `GameCosmetics` uses one global mutex for **all** registries
+
+`SetCapeOverride`, `SetTextureOverride`, `SetPieceAtlas`, `SetRenderGeometry`, `SetCosmeticFrame` all share `g_mutex`. A cosmetic update can block a texture override, which can block a skin capture. Use per-registry locks (or, better, the `CallbackSnapshot` pattern for all of them — see 1.1–1.6).
+
+### 3.5 `InitGameHooks` is `std::call_once`, but `ArmGameHookInstall` is a separate `std::call_once`
+
+Two separate `call_once` guards. If `ArmGameHookInstall` is called from `onCreate` and `InitGameHooks` later from the frame pump, they can race. In practice they don't (call_once is thread-safe), but the pattern is confusing. Combine or document.
+
+### 3.6 `HookInstallGate` has no timeout guard on `defer`
+
+If the launcher never delivers rules, `defer` is called up to `kMaxDefers = 8` times, then the gate gives up. But the launcher's `onCreate` doesn't know that — it just calls `ArmGameHookInstall`. The give-up is silent from the launcher's perspective until `GameHookInstallState()` is polled. Add a **callback** from the gate that the launcher can subscribe to (via JNI) when the install resolves (either way), so the UI can show "hooks installed" / "hooks unavailable" without polling.
+
+### 3.7 `SetJavaVm` and `GetJavaVm` are non-atomic pointer reads/writes
+
+`g_vm` is written once from `JNI_OnLoad` and read from every `ScopedJniEnv` constructor. Technically a data race if any other thread reads it during the write. In practice `JNI_OnLoad` happens before any thread uses the preloader, but it's not guaranteed. Use `std::atomic<JavaVM*>`.
+
+### 3.8 `SetActivity` / `ClearActivity` — `g_activity` is non-atomic
+
+Written from `nativeSetActivity` (UI thread), read from `CallActivityVoidMethod` (any thread). Data race. Use `std::atomic<jobject>`.
+
+### 3.9 `g_vm` / `g_activity` — the whole `JavaRuntime.cpp` pattern is racy
+
+Wrap the two in a single `struct RuntimeHandles { std::atomic<JavaVM*> vm; std::atomic<jobject> activity; }` and document the ordering.
+
+### 3.10 The `ScopedJniEnv` uses `thread_local` — but the destructor runs at thread exit, and `g_vm` may already be null (during JVM shutdown)
+
+`ThreadAttachment::~ThreadAttachment` calls `g_vm->DetachCurrentThread()` if `g_vm` is non-null. During JVM shutdown, `g_vm` may still be non-null but the VM is dead → `DetachCurrentThread` on a dead VM is UB. Guard: capture the VM at resolve time, and skip detach if the process is shutting down (use a `std::atomic<bool>` set from a `JNI_OnUnload` or `atexit`).
+
+### 3.11 `DispatchRenderCallbacks` catches exceptions but does not isolate them per callback
+
+If one callback throws, subsequent callbacks still run (the catch is inside the loop). Good. But it logs via `preloaderLogger.warn` which uses `fmt::vformat` — on a render thread. If a buggy mod throws every frame, this is a per-frame `fmt::vformat` allocation. `OnceReport` isn't used here (it is in `InputBridge`, not in `RenderApi`). Add `OnceReport`.
+
+### 3.12 `PostRenderCallback` runs on every render call; a slow callback blocks the render thread
+
+There's no watchdog. A mod could register a callback that does a 100ms HTTP request and the game freezes. There's a debug-only `HookTiming` seam that reports slow callbacks **after** they run — but no prevention. For a "most advanced" preloader:
+1. Measure every callback (always, not just debug — the cost is one `rdtsc`).
+2. Report over-budget callbacks via a *rate-limited* log line.
+3. Expose the per-callback timing via `nativeReadRenderCallbackStats` so the launcher can show which mod is causing stutter.
+
+### 3.13 `ModManager::EnableLoadedMods` runs all mod `enable()` on the caller's thread (frame thread)
+
+If a mod's `enable()` blocks, the frame freezes. For a "most advanced" loader: enable mods on a worker thread, or with a timeout (a mod that takes >100ms to enable gets flagged).
+
+### 3.14 `ModManager::DisableAndUnloadLoadedMods` — same
+
+### 3.15 Mod lifecycle calls are unguarded against reentrancy
+
+A mod's `enable()` that calls back into `pl::modmenu::setModuleEnabled()` would deadlock or corrupt the registry. Document and enforce (a per-thread "in lifecycle" flag, or a recursive mutex with a clear contract).
+
+---
+
+## 4. Signature scanning & vtable resolution
+
+### 4.1 `Signature.cpp` — single-threaded scan of ~220 MB `.text`
+
+The scan walks executable regions in 1 MB windows, sequentially. On a mid-range Android device, memory bandwidth is ~10 GB/s, but the scan is slower because of `process_vm_readv` (which is a syscall per window = 220 syscalls) and the AC automaton.
+
+**Optimizations:**
+1. **Parallel scan** — partition each region into N chunks (N = `std::thread::hardware_concurrency()`, cap at 4–6), one per thread. Each thread scans its chunk independently; patterns are resolved as `(target, firstHit)`. Combine with `atomic<bool>` per pattern for early exit. This gets 3–4× on modern SoCs (4 cores × memory bandwidth).
+2. **Use `memcpy` from a mapped pointer instead of `process_vm_readv`** — the regions are already mapped into the process, so a plain read of mapped memory works. The only reason for `process_vm_readv` is the "region unmapped mid-scan" edge case — this is rare and can be handled by catching `SIGSEGV` (or by re-reading `/proc/self/maps` if a fault occurred — but catching SIGSEGV is problematic). Better: keep `process_vm_readv` but batch it — read **multiple regions in one `process_vm_readv` call** using multiple `iovec` pairs. This amortizes the syscall.
+3. **Increase window size** to 8 MB (fewer syscalls), with a smaller AC state reset per window. Memory is available (a few MB).
+4. **Skip non-executable regions**. Already done (`execRegions`).
+5. **Skip already-matched regions** for subsequent patterns. Currently the loop is per-pattern-per-region; once all patterns are found, it early-exits. Good.
+6. **Use `mincore` to check the region is still resident** before reading — avoids a `process_vm_readv` syscall on unmapped memory.
+
+### 4.2 Aho-Corasick — one automaton per batch, but only for **anchors**
+
+Each pattern contributes its anchor (up to 8 exact bytes) to the AC. Then at each AC match, the full pattern is checked with `PatternMatchesAt`. That's the right design.
+
+But: **masked patterns are checked per byte** — for each byte in the buffer, for each masked pattern, `if (matches(pattern.bytes[pattern.anchorIndex], data[offset]))`. If 10 masked patterns exist, that's 10×N byte comparisons. On 220MB that's 2.2 billion comparisons.
+
+**Fix:** Build a second AC automaton over the *masked* anchor bytes by expanding the mask into a set of exact bytes (up to 16 for `4?`, 256 for `??` — cap at 4 candidates and fall back to byte-checking beyond that). Or use a "byte set" bitmap: for each anchor value `v`, `maskedPatterns[v].push_back(patternIndex)` — a single array index per byte.
+
+### 4.3 `getModuleInfoFresh` revalidates with `RegionsAreMapped` — one `process_vm_readv` **per region**
+
+`RegionsAreMapped` does a `process_vm_readv` for each region (1 byte), then reads the ELF magic. For a module with 10 regions, that's 10 syscalls per `getModuleInfoFresh` call. `getModuleInfoFresh` is called from `resolveSignatures`, `isExecutableAddress`, and `resolveVtableSlotReferencingString`. If these are called often (they're not, but they could be), this is slow.
+
+**Fix:** 
+1. Combine all region probes into **one** `process_vm_readv` with `iovec` arrays.
+2. Cache the result for a few ms (e.g. `std::chrono::steady_clock::now()` and a `lastCheckMs`). Within 16ms, skip the re-validation.
+3. Or don't re-validate at all on every call — the process is unlikely to unmap `libminecraftpe.so` mid-session.
+
+### 4.4 `sigCache` and `patternCache` — one `shared_mutex` for both
+
+Two caches, one lock. Fine for read-heavy workloads, but writes (on each new pattern) block all readers. Separate the mutexes, or use `sharded_mutex` (16 buckets by hash).
+
+### 4.5 `patternCache` is unbounded — grows forever
+
+For a long-running session with rules updates, this could grow. Add an LRU cap (e.g. 1024 entries) or clear on rules reload.
+
+### 4.6 `sigCache` stores only resolved (non-zero) addresses — good
+
+But: **negative cache** is also useful if a pattern is known to be absent. Currently `UpdateDiskCache` intentionally doesn't store zeros (to re-derive on next launch if the rule changed). That's a design choice, but during a session, `resolveSignatures` re-derives an absent pattern on **every call**. Add an in-memory negative cache **keyed on `(module, buildId, signature, revision)`** and invalidate on rules reload. This is safe (the build hasn't changed) and saves repeated full scans.
+
+### 4.7 `resolveSignatures` calls `getModuleInfoFresh` first, then `ApplyDiskCache`, then scan, then `UpdateDiskCache` — five separate phases
+
+The disk cache read/write are on the resolve path. If disk I/O is slow, this blocks. Offload `UpdateDiskCache` to a worker thread (fire-and-forget, with a bounded queue).
+
+### 4.8 `UpdateDiskCache` reads + parses + writes the cache file on every resolve batch
+
+Even when only one signature resolved. Batch across calls: accumulate and flush every 5 seconds, or on session end.
+
+### 4.9 `ResolveExportedSymbol` does `dlopen` (RTLD_NOLOAD) + `dlsym` + `dlclose` per signature
+
+Each `dlopen` is ~10µs. For a batch of 20 signatures, that's 200µs. Could `dlopen` once per batch, `dlsym` for all, `dlclose` at end. Same for the whole resolve session.
+
+### 4.10 `Vtable.cpp::findBytes` — linear `memchr` + `memcmp` over `.rodata`
+
+`.rodata` for `libminecraftpe.so` is tens of MB. `findBytes` walks it looking for the typeinfo name string. That's a first-pass scan.
+
+**Fix:** 
+1. Use SIMD `memchr` (ARM NEON `vceqq_s8` on 16-byte blocks) — 16× faster.
+2. Cache results: `typeinfo name address` is stable per process, so memoize by name in a `shared_mutex`-protected map.
+3. Build a **string index** of `.rodata` (an offset list of all NUL-terminated strings, sorted by hash) at first use. Then a lookup is a binary search. Building the index is one linear scan (`memchr` for `\0`, hash the between-bytes) which is slower the first time but amortizes if you look up many type names.
+
+### 4.11 `Vtable.cpp::findTypeInfo` — linear scan of `.data.rel.ro` (potentially tens of MB)
+
+Same issue. `.data.rel.ro` for large Android binaries is 5–50 MB. Scanning word-by-word for the typeinfo pointer is O(size/8) per lookup.
+
+**Fix:** 
+1. **Build a relocation index** at first use: read `.rela.dyn` (which the preloader could parse — the file itself is in `/proc/self/maps`), build `map<target_address, addend>`, and then lookup by typeinfo pointer is O(log n) via a sorted array. This is exactly what `tools/gen_rules.py` does offline.
+2. Without relocation parsing, at least use `memchr`-like SIMD search for the 8-byte typeinfo pointer. On ARM64, `ldr` + `cmp` in a loop with unrolling (`4 words at a time`) gives ~4× over the scalar version.
+
+### 4.12 `resolveVtableSlotReferencingString` calls `FunctionReferencesAddress` per slot — O(slots × body)
+
+For `LivePlayerRenderer` with ~100 virtual slots, each function body up to 4KB, that's 400KB of disassembly per lookup. Called once per `InitPlayerRenderSource` and once per `InitNativeCosmeticRenderHook` — so twice per install. But the memoization in `Vtable` covers repeated calls within the session.
+
+**Fix:**
+1. **Cache the result by `(typeName, needle)`** in the vtable memo. Already done? Let me re-read... The memo is `makeVtableSlotKey(normalizedName, slot, moduleName)` — keyed on **slot**, not on **needle**. So `resolveVtableSlotReferencingString` doesn't hit the memo. Add a separate memo keyed by `(typeName, needle, module)`.
+2. Use the next slot's address as the end (already done via `NextSlotAddress`).
+3. **Reduce the scan window** from `0x4000` (16 KB) — most functions don't reference the needle in the first 16 KB, but that's the whole function for most. Keep.
+4. **Parallelize** slot scans across threads. Each slot is independent.
+
+### 4.13 `resolveVtableSlotReferencingString` `FunctionReferencesAddress` stops scanning at the first function prologue
+
+Currently: `if (i > 4 && IsFunctionPrologue(w)) return false;`. The `i > 4` is to skip the slot's own prologue. But if the function body has a **secondary** function prologue (e.g. a cold path), the scan stops early. Acceptable, but the window (16 KB) is short enough that it rarely matters.
+
+### 4.14 `GlossGetLibSection` is called per resolve — no caching
+
+Each call does `GlossOpen` internally (possibly re-parsing the ELF). Cache the section address + size per `(module, section)` in the vtable module.
+
+### 4.15 `tools/gen_rules.py` could be invoked at runtime for **dynamic** rules
+
+Not recommended (requires parsing the on-disk `.so` file), but worth documenting: the current pipeline requires the launcher to generate rules offline and deliver them.
+
+### 4.16 `SignatureScanCache` — one file per module
+
+Fine. But on a build update, the old file remains. Add cleanup of stale files (`<module>.<oldBuildId>.sigcache` when the new buildId doesn't match any current mapping).
+
+### 4.17 `SignaturePattern::SelectAnchor` — anchors on the **last** long run
+
+Documented as "so the anchor sits as late as possible". This is a heuristic — for a pattern whose first 8 bytes are exact but whose later 8 bytes are masked, the anchor on the last run may be in the masked tail. Actually the algorithm takes the *longest* run; ties broken by position. Correct.
+
+But: the anchor is capped at 8 bytes. For an AC automaton, 8 bytes is enough discrimination. Fine.
+
+### 4.18 `ModulePathMatch` — the pure module is used by `Signature.cpp` but **not** by `CameraSource` / `NativeCosmeticContext` — fix per 1.3
+
+### 4.19 `ElfBuildId` reads up to 4096 bytes of header — could be smaller
+
+The build-id PT_NOTE can be anywhere in the file (though typically in the first 4 KB). If the PT_NOTE is past 4 KB, `getModuleInfo` reads zero build id and falls back to module-name cache key. Add a fallback: read the first 64 KB of the file if `ReadElfBuildId` fails on 4 KB.
+
+---
+
+## 5. Hook subsystem
+
+### 5.1 `Hook.cpp` — global `std::mutex mtx` for every hook call
+
+`hook()`, `unhook()`, `hookCount()`, `unhookAll()` all take `mtx`. For hot paths (none) it's fine, but `hookCount()` is called from `nativeReadRenderDiagnostics` — a UI poll path. Make `hookCount()` lock-free by maintaining an `std::atomic<size_t>` counter incremented/decremented on map insert/erase.
+
+### 5.2 `HookData::~HookData` calls `GlossHookDelete` — good, but not exception-safe
+
+`GlossHookDelete` could (in theory) throw an exception from the underlying library. `~HookData` is called from `map.clear()` which is inside `unhookAll` under `mtx`. An exception would escape `unhookAll` and propagate through `mtx` (fine but bad). Wrap in `try/catch`.
+
+### 5.3 `hook()` calls `GlossInit` via `call_once` — good, but `GlossEnableLog(true)` is set unconditionally
+
+Every install prints GlossHook logs. For a production build, disable after the first install (or gate on a debug define).
+
+### 5.4 `VerifyPatchedPrologue` reads a single 32-bit word — could be fooled by an unpatched function whose first instruction happens to be a branch
+
+The current rule accepts *any* branch-like instruction (B, BL, BR, BLR, B.cond, CBZ, TBZ, LDR-literal, ADRP). A function that starts with a `B` (e.g. a thunk) would pass verification even if the hook wasn't installed.
+
+**Fix:** in addition to the branch-like check, verify the first instruction is **not equal to the original** (read the original 4 bytes before installing, compare after). If they're equal, the patch didn't take. This catches thunks.
+
+### 5.5 `PrologueVerify::ClassifyPrologue` doesn't verify `LDR X18, #8; BR X18` pairs
+
+GlossHook's absolute-jump encoding is `LDR X18, #8; BR X18; <dest>` or `ADRP X18, page; BR X18`. The current check passes any of those individually. For a "most advanced" preloader: verify the **sequence** (first two instructions form the expected pattern, OR the first instruction is `LDR X18` and the second is `BR X18`).
+
+### 5.6 `hook()` does not log the trampoline address
+
+When a hook installs, `h->origin` is the trampoline. Logging it (in debug) helps diagnose mod conflicts.
+
+### 5.7 `unhook()` iterates `h->chain` linear — fine for a chain of 2–3
+
+### 5.8 `hookCount()` returns the number of *targets*, not hooks
+
+If two detours are chained on one target, `hookCount()` returns 1. The doc comment says "distinct targets". Consider returning both (`{targets, totalHooks}`).
+
+### 5.9 `GlossHookManager` alias `DobbyHookManager` — the Dobby API is a fake shim
+
+For a "most advanced" preloader: either **actually vendored Dobby** (compiled for aarch64 — the CMakeLists note says upstream Dobby doesn't build, but there's a fork like `Dobby-Android` that does) or **drop the Dobby names entirely** and expose a clean `pl::memory::hook` (which is the real backend). The fake Dobby names are a compatibility facade that adds confusion.
+
+If Dobby is needed for a specific mod's API expectations (some mods use Dobby's `DobbyHook`), keep the shim but document it clearly. If not, remove.
+
+### 5.10 `LegacyHook` `pl_hook` — one C function that forwards to `pl::memory::hook`
+
+Fine. But `pl_hook` doesn't validate `priority` (accepts any `PLHookPriority` enum value, including ones outside the 5 defined). Clamp or reject.
+
+### 5.11 No hook **priority conflict detection**
+
+If two mods hook the same target with different priorities, the current code logs "already hooked by [...]". For a "most advanced" preloader, expose this via a `nativeListHookConflicts()` JNI so the launcher can show "mod A and mod B conflict on `Foo::bar`".
+
+### 5.12 No hook **lifetime binding to mod**
+
+When a mod is unloaded, its hooks remain (they're on `pl::memory::hook` with no owner). This leaks a function pointer to the mod's `.so`, and after `dlclose` (which the mod manager doesn't call — see 6.x) the pointer becomes invalid. 
+
+**Fix:** tag each hook with an **owner** (a `uint64_t modInstanceId` from `ScopedCurrentMod`), and on mod unload, unhook all hooks owned by that mod. This is critical for hot reload.
+
+### 5.13 No hook **reentrancy protection**
+
+A detour that calls back into the same function (accidentally) recurses infinitely. GlossHook has hooks to detect this (see the Gloss.h docs), but the preloader doesn't enable them. For a "most advanced" preloader: opt-in `pl::memory::hook` with a "no reentrancy" flag that installs a `thread_local` guard.
+
+### 5.14 `unhookAll()` — good, but called from nowhere in production
+
+Wire it to a "safe mode" or "unload all mods" path.
+
+### 5.15 `HookHandle` RAII — not used by any internal code
+
+Internal code uses raw `hook`/`unhook`. Migrate to `HookHandle` where applicable for exception safety.
+
+---
+
+## 6. Mod loader
+
+### 6.1 No **hot reload**
+
+The biggest missing feature. A mod update requires a game restart. For a "most advanced" preloader:
+1. Unload the mod's hooks (via owner tagging, see 5.12).
+2. Call the mod's `unload()` lifecycle.
+3. `dlclose` the `.so` (only if no other mod links it; use `RTLD_NODELETE` for safety, or track references).
+4. Remove the mod from the registry.
+5. `dlopen` the new version.
+6. Call the new mod's `load()` and `enable()`.
+7. Re-register its menu modules, buttons, fonts, images.
+
+This is achievable in ~2–3 days of work. The infrastructure is already there (`unloadLoadedModEntry`, `UnregisterModulesForModId`, `ScopedModMenuOwner`).
+
+### 6.2 No **parallel mod loading**
+
+`LoadModLibrary` is called serially from JNI. Mods are independent (until dependencies are checked), so they can load in parallel. Even with 3 mods, 3× parallel = ~3× faster startup (each `dlopen` is 10–100ms).
+
+**Fix:** use a `ThreadPool` to load mods in parallel, then **enable** in dependency order (serial). Correctness: mod A depending on B needs B's `load()` to complete before A's `load()`. So parallelize *load*, serialize *enable*.
+
+### 6.3 No **signature verification**
+
+A mod's `.so` is loaded as raw native code with no signing check. An attacker who can replace a mod's `.so` in `/data/user/0/.../mods/` can execute arbitrary code as the game. Since the preloader runs in the game process, this is game-process code execution.
+
+**Fix:**
+1. Ship an Ed25519 public key with the preloader.
+2. The launcher signs each mod's `.so` (or a manifest hash) with its private key.
+3. On load, verify the signature before `dlopen`.
+4. Allow an "unsigned mods" toggle in developer settings.
+
+### 6.4 No **resource quotas** per mod
+
+A mod can allocate unlimited memory, spawn unlimited threads, and consume unlimited CPU. For a "most advanced" loader:
+1. Track memory per mod via a custom allocator that's tagged with the mod's id.
+2. Enforce a **cap** (e.g. 256 MB per mod, configurable).
+3. Track thread counts (via `/proc/self/task` diff or `pthread_create` interception).
+4. **Warn** the user (don't kill) when a mod exceeds its budget.
+
+### 6.5 No **fault persistence across sessions**
+
+`ModFaultPolicy` is in-memory. On restart, all faults are forgotten. The launcher is supposed to persist the count and pass it via Optifine config, but the mod loader doesn't use that mechanism.
+
+**Fix:** persist mod fault counts in a small JSON file (`mods/.faults.json`), keyed by mod id + version. On load, read it. Reset on successful `enable()`.
+
+### 6.6 `NativeModLifecycle::acquireModHandle` does `dlopen(NOLOAD)` then `dlopen(RTLD_NOW|RTLD_GLOBAL)`
+
+`RTLD_GLOBAL` means **every** symbol from the mod is visible to every other mod — symbol collisions can happen. For a "most advanced" loader: use `RTLD_LOCAL` (default) and let mods explicitly export. This is a breaking change for existing mods that rely on `RTLD_GLOBAL` — gate behind a manifest field `"global_symbols": true`.
+
+### 6.7 `NormalizeLibraryPath` uses `weakly_canonical` — resolves symlinks
+
+If the user intentionally symlinked a mod (e.g. from a different directory), `weakly_canonical` resolves it and the dedup key differs from the requested path. Fine, but note in docs.
+
+### 6.8 `findModRootForLibraryPath` walks parents checking for `manifest.json` — O(depth) `stat` calls per mod
+
+For 20 mods in `/data/user/0/.../mods/<id>/lib/libmod.so`, that's 20 × 3 `stat` calls. Fine.
+
+But: `parseModDirectory` is called on each candidate parent — so `findModRootForLibraryPath` parses the manifest of every ancestor. If a mod is at depth 4, that's up to 3 manifest parses (none succeed until the right one). Fine, but could cache.
+
+### 6.9 `ModManifest.cpp` uses `fopen`/`fread` — no `mmap`
+
+For a manifest (< 4 KB), irrelevant. But the same pattern in `AntEggLoader` matters (see 2.16).
+
+### 6.10 `LoadedModRegistry` — no thread-safety for `getLoadedModEntry` returning a copy
+
+`getLoadedModEntry` copies the entry under `gLoadedModsMutex`. If the caller then uses the `cppRegistration` pointer, and the mod is unloaded concurrently, this is a race. Document: callers must ensure no concurrent unload.
+
+For "most advanced": use `shared_ptr<LoadedModEntry>` and let callers hold a strong ref while using the pointer.
+
+### 6.11 `ModLoadOrder` — no **version constraints**
+
+Dependencies are `["core", "lib"]` (ids only), no version. If `lib` is version 2.0 and the mod requires 1.0, the loader can't tell. Add `"dependencies": [{"id": "lib", "min": "1.0.0", "max": "2.0.0"}]` support.
+
+### 6.12 `ModLoadOrder` — no **conflict declarations**
+
+A mod can declare `"conflicts": ["other-mod"]`. If `other-mod` is also loaded, refuse one or warn. Essential for a mature loader.
+
+### 6.13 `ModLoadOrder` — no **load priority**
+
+If two mods both hook `Foo::bar` and neither declares a dependency, the chain order is registration order. Add `"priority": 100` to the manifest, used as the secondary sort key. (Hooks already have `HookPriority`, but that's per-hook; mod priority is a default.)
+
+### 6.14 `ModManifestValidation` — `entry` must be `.so`, but `type: "script"` accepts `.lua`
+
+Fine. But there's no **engine** field. A mod using Lua 5.4 vs 5.1 needs different runtime. Add `"engine": {"language": "lua", "version": "5.4"}`.
+
+### 6.15 No **mod update channel**
+
+The launcher is responsible for updating mods; the preloader doesn't know about versions. For a "most advanced" loader: expose `nativeGetModManifest(id)` and `nativeUpdateMod(id, manifestJson, libraryBytes)` so updates can happen without a launcher restart... but this requires the hot reload from 6.1.
+
+### 6.16 `nativeLoadMod` JNI signature uses `jobject modObj` — unused
+
+The `modObj` parameter is ignored. If it was intended for a `Mod` Kotlin object (to map the native mod to the Java side), this is a lost opportunity. Wire it: the Java `Mod` object could carry `icon`, `author`, `displayName`, and the native loader could validate consistency.
+
+### 6.17 `ModManager::LoadModLibrary` — no **per-mod error reporting**
+
+The JNI `nativeLoadMod` returns `JNI_TRUE`/`JNI_FALSE`. On failure, the launcher gets a boolean and a logcat line. For a "most advanced" loader: return a `String` with the exact failure reason (like `AntEggLoader::ParseManifest` does).
+
+### 6.18 No **mod dev SDK**
+
+Mods are written against the C++ headers. For a "most advanced" preloader, ship a **mod template** with CMake, a sample mod (hook + menu + config), and a `pl mod new` CLI. This is a huge ergonomic win.
+
+### 6.19 `ScopedModMenuOwner` — RAII for `g_currentOwnerModIds` — good. But not exception-safe in `ModManager::EnableLoadedMods`
+
+If `enableLoadedModEntry` throws (it catches exceptions internally, good), fine. But `registerLoadedMod` doesn't use `ScopedModMenuOwner` — it uses `registerCppModule` which reads `CurrentOwnerModId()`. For `createLoadedModEntry`, it wraps in `ScopedModMenuOwner owner(modInfo.modId)`. Good.
+
+### 6.20 `ModFaultPolicy` — `recordSuccess` doesn't reset `mDisabled`
+
+Correct (documented): a success does not re-enable a disabled mod. But this means a user who fixes a mod's bug externally must explicitly `clear()`. Document.
+
+---
+
+## 7. Cosmetics pipeline & image hook
+
+### 7.1 `mce_image_hook.cpp` — `HookLoader` computes FNV-1a on every shaped payload
+
+FNV is 1 byte/iteration with a multiply. For a 64×64 skin (16KB), that's 16K multiplies per skin load. Skins load rarely (~once per player join). Fine. But for a cape texture (64×32 = 8KB), also fine. For a **bulk load** of many textures at world start, this could be a few hundred ms.
+
+**Fix:** skip the hash when no substitution is registered (already done: `hasSourceSize`). But the **capture** path runs unconditionally on every shaped payload (which requires computing the shape — cheap for PNG since it reads the IHDR; for RGBA8 it computes the square edge, cheap). So the FNV is only computed when a substitution exists. Good — this is already the right design.
+
+### 7.2 `CaptureSkin` and `CaptureCape` allocate a new vector on every shaped payload
+
+For a player's skin texture loaded once, fine. But `CaptureSkin` allocates on **every** skin-shaped payload — and skins can be re-uploaded repeatedly (e.g. on resource pack reload, on skin change from the launcher, etc.). If a skin is re-uploaded 10× per session, that's 10 × 16 KB allocations + copies. Minor.
+
+For "most advanced": only capture if the payload **differs** from the current capture (compare a hash first). Or only capture the **last** one within a coalescing window (100ms).
+
+### 7.3 `BuildImageFromPng` / `BuildImageFromRgba` — `InvokeLoader` zeros 0x30 bytes then calls the loader
+
+The `memset` of 0x30 bytes is cheap. But: `LoaderReturn result{}` then `result = fn(...)`. The `result{}` initializes 48 bytes to zero, then the call overwrites. Minor.
+
+### 7.4 The `LoaderReturn` (48-byte) return type forces the x8 sret ABI — **correct**, but the size is a magic 48
+
+Document why 48 (must be > 16). Could static_assert with a comment.
+
+### 7.5 `ReadMceImageHookDiagnostics` — `out[1]` and `out[2]` are the same value (both `g_imagePathVerified`)
+
+Bug: `out[1] = g_imagePathVerified ? 1 : 0; out[2] = g_imagePathVerified ? 1 : 0;`. Probably meant one to be `g_probeRan` or `g_hookInstalled`. Fix.
+
+### 7.6 `ReadCapeCaptureDiagnostics` — `out[2] |= substitutions << 32` is a **bug**
+
+`out[2]` is a `uint64_t`. `substitutions << 32` where `substitutions` is a `uint32_t` — the shift happens in 32-bit space and the result is then widened, **losing the high bits**. Actually, C++ integer promotion rules: `substitutions` is promoted to `int` (32-bit) → shift by 32 is **undefined behavior** in C++ (shift count >= width). Should be `static_cast<uint64_t>(substitutions) << 32`.
+
+### 7.7 `HookLoader` calls `g_originalLoader` — if `g_originalLoader` is null (race with install), returns empty `LoaderReturn`
+
+The return type is 48 bytes, so returning `LoaderReturn{}` (zeroed) means the caller sees "failure". Correct (fail-closed), but the empty return passes through as if the engine reported failure. Fine.
+
+### 7.8 The image pipeline hook uses `ImageOverrideRegistry::find(hash, sourceSize)` — a binary search
+
+Good. But `hasSourceSize` is a **linear scan** of the vector. For 3 entries, fine.
+
+### 7.9 `SetContentSubstitution` uses `Fnv1a` — this is a *non-cryptographic* hash
+
+Collisions are possible. For a substitution keyed on user-controlled bytes, this is a minor concern (an attacker who can control the incoming texture bytes could craft a collision). But the bytes are the game's textures, so not user-controlled. Fine.
+
+### 7.10 `SkinSeamObservation::ClassifySkinSeam` ignores `textureHookInstalled` and `textureCalls`
+
+`(void) textureHookInstalled; (void) textureCalls;` — the texture counters are read but not used in the classification. The comment says the join hook is the primary evidence. But the function takes the texture params and ignores them; consider removing them from the signature or using them (e.g., if texture hook is installed but `textureCalls==0` after joins, the drop is at the texture seam).
+
+### 7.11 `SwapCapeImage` copies 0x30 bytes — but does not **verify** the destination struct was the one the engine expects
+
+If a mod passes a `skinRef` that isn't actually a `SerializedSkinRef`, this writes 0x30 bytes into an arbitrary location. For a "most advanced" preloader: verify the pointer is inside a readable+writable mapping of the game module (via `queryMemoryRegion`) before writing. Cheap (one `/proc` read), high safety.
+
+### 7.12 `NativeCosmeticContext::WorldFromLocalPlayer` returns identity on no player
+
+Documented. But the render path uses this as a fallback and would draw cosmetics at the origin. `NativeRenderHook::GetCosmeticWorld` has a better fallback (position + camera). Consolidate.
+
+### 7.13 `NativeRenderHook::OnPlayerRenderFrame` — only sets `g_callbackLive`
+
+The actual cosmetics rendering is gone (replaced by the engine image pipeline). This is correct per the current design, but the class name (`NativeRenderHook`) and the `BoneMatrixSource` API are **vestigial** — they're referenced in the public headers and never used. Either implement a real mesh renderer (for hats/pets that don't have textures) or deprecate the API.
+
+For a "most advanced" preloader, a **real mesh renderer** for hats/pets would be valuable:
+- Parse the `.geo.json` (already done in `BedrockModelParser`).
+- Build a vertex buffer.
+- Hook the GL draw call and inject a draw for the cosmetic mesh.
+- Requires the game's GL state (or a safe save/restore).
+
+This is the "native-cosmetic-render-route.md" Phase D, which the doc says is blocked. For a "most advanced" preloader, it's the key differentiator vs. just using resource packs. Consider re-attempting with the **Vulkan backend** (via `libvulkan.so`) — many Android devices are now Vulkan-only, and the doc says "the cape path works on a Vulkan-only backend" via the image pipeline, but a mesh renderer would need Vulkan. That's a big project.
+
+### 7.14 `BedrockModelParser` — per-vertex trig per cube corner
+
+For each cube, 8 corners are rotated (`rotateAbout` → `rotateVector` → 3 `cos` + 3 `sin` calls). For 6 faces × 4 vertices, that's 6 cubes × 8 corners × 6 trig = 288 trig per cube. For a 10-bone pet with 4 cubes each, ~11,520 trig calls at load time. That's ~100µs, but for a model with 100 cubes it's 1ms. Precompute the 3×3 rotation matrix once per bone/cube and reuse for all corners.
+
+### 7.15 `BedrockModelParser` — `transformChain` linear search through `names` per bone
+
+For each bone, walks up the parent chain, doing a linear search through `names` at each step. For a 20-bone model, that's 20 × 20 = 400 comparisons. Fine, but precomputing a `map<string, const Bone*>` is O(20) build + O(1) per lookup.
+
+### 7.16 `BedrockModelParser::build` — emits 6 faces per cube, 4 vertices per face (24 vertices), 36 indices
+
+For a large model (10 bones × 20 cubes = 200 cubes), 4,800 vertices. Fine for one draw. But the buffer is rebuilt on every call (`build`), not cached. `InitNativeCosmeticRenderHook` doesn't call `build`; the actual rebuild is triggered by `ParseGeometryForPieceData` which is called from... the render hook? Let me check... `NativeRenderHook.cpp` doesn't call it. `NativeCosmeticData.cpp::ParseGeometryForPieceData` is called from... the tests and possibly the (now-removed) render path. So `build` is not in a hot path. Fine.
+
+### 7.17 `AnimationSolver::sample` — linear search for the segment
+
+For a track with 100 keyframes, 100 comparisons per sample. For 60 samples/frame, 6000 comparisons/frame. Fine for one track, but with 20 tracks it's 120K/frame. Binary search by `time` (already sorted) reduces this to log2(100) = 7 comparisons.
+
+### 7.18 `AnimationSolver::parse` — `std::stof` can throw
+
+Uses try/catch which is fine but expensive (exceptions are ~1µs each). For 100 keys, 100 try/catch = 100µs. Use `std::from_chars` (no exceptions, ~10× faster).
+
+### 7.19 `ClothSolver` — fixed substeps, no accumulation tracking
+
+`step` accumulates and runs up to `kMaxSubsteps=4` per call. If the game is running at 30Hz, that's 2 substeps per frame. If it stalls and then resumes, the accumulator is clamped. Fine. But the `mAccumulator` is a `float` — precision loss over long sessions. Use `double` or reset on frame boundary.
+
+### 7.20 `NativeModelMatrix::multiply` — 64 multiplies + 48 adds per call
+
+For a 4×4 matrix multiply, this is standard. But `composeCosmeticMatrix` does two multiplies (world * (bone * offset)) = 128 mults. For one bone per frame, fine. For 20 bones, 2560 mults/frame — negligible.
+
+---
+
+## 8. Camera / render context
+
+### 8.1 `CameraSource::ResolveOnce()` — see 1.4
+
+### 8.2 `CameraSource::ReadFrame` — revalidates per frame
+
+Fine. But: `frame.viewProjection = Mat4::multiply(frame.projection, frame.view)` — this is 64 mults per frame, fine.
+
+### 8.3 `CameraSource` doesn't handle the case where the game uses **row-major** matrices
+
+Most engines use column-major, but if a build changes to row-major, the current validation (`m[11] ≈ -1`) would still pass but the transform would be transposed. Add a heuristic: check `m[3]`, `m[7]`, `m[11]` — for column-major, `m[3]=m[7]=0, m[11]=-1`; for row-major, `m[12]=m[13]=0, m[15]=1`. The current `ValidateView` checks `m[3]`, `m[7]`, `m[11]` — so it's explicitly column-major. If the engine switches, the resolve fails (fail-closed). Good.
+
+### 8.4 `CameraSource` — `g_viewAddress`/`g_projectionAddress` are atomics but never reset on a module reload
+
+If the game module is reloaded (impossible for `libminecraftpe.so`), the addresses would be stale. Not a concern in practice.
+
+### 8.5 `ComputeViewProjection` — hardcoded `kFov = 70`, `kAspect = 16/9`, `kNear = 0.05`, `kFar = 512`
+
+The aspect ratio is wrong for non-16:9 devices (phones with 20:9 or tablets with 4:3). The viewport is available via `glGetIntegerv(GL_VIEWPORT)` — use it. The FOV could come from the game (Bedrock default is 70 but user-configurable). Expose `fovDegrees` via a setter.
+
+### 8.6 `ComputeViewProjection` — doesn't account for third-person camera offset
+
+The doc mentions it. For a "most advanced" preloader: hook the camera's own setup (a vtable slot like `Camera::update` or `LevelRenderer::setupCamera`) to get the real camera. Requires a per-build slot — but the string-based `resolveVtableSlotReferencingString` can find it (search for a camera-related diagnostic string).
+
+### 8.7 `RenderApi::DispatchRenderCallbacks` — `QueryViewport` calls `glGetIntegerv` per frame
+
+`glGetIntegerv` is a driver call, possibly 100+ns. Fine once per frame, but it's called even when the viewport didn't change. Cache; invalidate on a resize hint (from the game's own viewport setup).
+
+### 8.8 `RenderApi::DispatchRenderCallbacks` — `g_callbacks.size()` returns `atomic_load()->size()`
+
+One atomic load + one deref. Fine.
+
+### 8.9 `RenderApi::DispatchRenderCallbacks` — `CameraSource::ReadFrame()` per frame
+
+Fine. But for multiple consumers, cache the `RenderContext` per frame.
+
+### 8.10 `RenderApi` — no **frame number** exposed to callbacks
+
+`context.frameTick` is present. Good.
+
+### 8.11 `RenderApi::RegisterRenderCallback` triggers `CameraSource::ResolveOnce` on the caller's thread
+
+If a mod calls `RegisterRenderCallback` from its `load()`, the scan blocks the load. See 1.4 — do it on a worker thread.
+
+### 8.12 `SwapFrameBoundary` — `eglSwapBuffers` hook install could be slow
+
+Called from `InitGameHooks`. `dlopen` + `dlsym` + `GlossHook` = ~500µs. Fine.
+
+### 8.13 `SwapFrameBoundary` — the veneer writes `pl_runtime_swap_buffers_last_us` via `clock_gettime`
+
+Called on every `eglSwapBuffers` — 60Hz × 1 = 60 clock_gettime per second. Negligible.
+
+### 8.14 `SwapFrameBoundary` — doesn't chain other modules' EGL hooks
+
+If another mod also hooks `eglSwapBuffers`, both detours chain (GlossHook chains), and both counters increment. Fine. But the *order* of callbacks depends on install order. Document.
+
+### 8.15 `SwapFrameBoundary` — no **vsync detection** from the swap timestamp
+
+The `FramePacingAnalyzer` uses `g_displayRefreshHz` for lock detection, but the swap timestamp could directly tell us if frames are ~16.67ms apart. Add a "vsync interval from swap" reading.
+
+---
+
+## 9. JNI surfaces
+
+### 9.1 `nativeReadCapturedSkin` / `nativeReadCapturedCape` — see 1.5
+
+### 9.2 `nativeReadCosmeticsStats` — allocates 4-int array per call
+
+Fine (16 bytes). But the stats are read from `g_passthrough_*` counters (atomics), no lock. Good.
+
+### 9.3 `nativeReadRenderDiagnostics` — 19-field array per call
+
+The `values[19]` array is on stack, then copied to a JNI array. Fine.
+
+But: `ReadGpuStrings()` inside the function can call `glGetString` (driver call). If the GPU strings haven't been read yet, this blocks on the driver. Called from UI poll — could be slow the first time. Make it async / cached.
+
+### 9.4 `nativeReadProcessMemory` — reads `/proc/self/smaps_rollup` and `/proc/self/statm` per call
+
+Each read is 100µs+. Called from UI poll. **Cache** with a 1-second TTL.
+
+### 9.5 `nativeReadFramePacing` — atomics only, fine
+
+### 9.6 `nativeReadFramePacingPercentiles` — sorts 2000 elements per call — see 2.3
+
+### 9.7 `nativeReadLocalPlayerFeed` — six-field array, fine
+
+But calls `ReadLocalPlayerPosition` + `ReadLocalPlayerRotation` separately (two snapshots). See 2.21.
+
+### 9.8 `nativeSetActivity` — global ref, must be released on clear — already done
+
+### 9.9 `nativeBuildCapeImage` — allocates `kImageSize=0x30` array per call, then `BuildCapeImageFromPng` invokes the loader (which allocates an engine image)
+
+Fine.
+
+### 9.10 `nativeSetCapeSubstitution` — copies the whole `byte[]` under `g_mutex`
+
+Same as 2.13.
+
+### 9.11 `nativeReadCapeCaptureDiagnostics` — 4 jlongs, fine
+
+### 9.12 `nativeFeatureAvailability` — string, fine
+
+### 9.13 `nativeHookSelfTest` — returns a string; the self-test runs synchronously on the caller's thread
+
+If the launcher calls this during a frame-critical moment, the round-trip could cause a frame drop. Add `nativeStartHookSelfTest()` (async) + `nativePollHookSelfTest()`.
+
+### 9.14 `nativeLoadMod` — returns boolean, no error detail — see 6.17
+
+### 9.15 All `nativeConfigure*` calls — no **validation** of the JNI input in some cases
+
+E.g. `nativeSetCapeOverride` doesn't check `width * height * 4` overflow. For width=65535, height=65535, that's 17 GB — `expected` underflows. Add overflow checks:
+```cpp
+if (width > 16384 || height > 16384) return;  // cap
+```
+
+### 9.16 `nativeRenderSvgToPng` — 4MB cap, fine. But `lunasvg` can be slow for complex SVGs
+
+Add a timeout (spawn on a thread, cancel after 500ms). Or cache the rendered PNG by hash.
+
+### 9.17 No **JNI exception checks** after `NewStringUTF` (UTF-8 validation) — but `NewString` sanitizes first, good
+
+### 9.18 `jbyteArray` results for `nativeReadCapturedSkin` — no way to know "no data" vs "0 bytes"
+
+Returns `nullptr` on no data. Callers check. Fine.
+
+### 9.19 `nativeEncodeCosmeticAdvert` — returns `jbyteArray`, fine
+
+### 9.20 `nativeGetExternalModConfigSchema` — string, fine
+
+### 9.21 `nativeGetDrawCommands` — see 2.19
+
+### 9.22 `nativeRegister...` calls — some are `void`, some return `bool`
+
+Inconsistent. Make all return `bool` (or a struct with `{ok, error}`).
+
+---
+
+## 10. Logging, diagnostics, feature availability
+
+### 10.1 `Logger` — see 2.8
+
+### 10.2 `Logger::getOrCreate` — one global mutex, unbounded map
+
+For each new tag, allocates a `Logger`. Fine, but if mods create many tags, the map grows. Add a cap or an LRU.
+
+### 10.3 `FeatureAvailability::toJson` — rebuilds string on every call
+
+Called from `nativeFeatureAvailability` on UI poll. Cache and invalidate on any `set()`. Cheap.
+
+### 10.4 `FeatureAvailability` — no **per-feature reason version**
+
+If a feature transitions `Unavailable → Available`, the reason should update. It does (`set` with new reason). But if a feature is set with no reason (which omits the field), the old reason is not cleared — wait, it is (`mEntries[index].reason.assign(reason.data(), reason.size())` with empty reason clears). Good.
+
+### 10.5 `HookSelfTest` — see 2.9
+
+### 10.6 `GameHookRulesSummary` — string, fine
+
+### 10.7 `ReadMceImageHookDiagnostics` — out[1] and out[2] duplicate — see 7.5
+
+### 10.8 `ReadCapeCaptureDiagnostics` — shift bug — see 7.6
+
+### 10.9 `ModuleMap::CountModuleMappings` — reads `/proc/self/maps` per call — see 9.4
+
+### 10.10 No **structured log sink**
+
+Logs go to logcat. For a "most advanced" preloader: an in-memory ring buffer of the last 1000 log lines, exposed via JNI, so the launcher's diagnostics page can show the last N lines without `adb logcat`. Add `nativeGetRecentLogs(count)`.
+
+### 10.11 No **log level control from JNI**
+
+The launcher can't change the log level. Add `nativeSetLogLevel(int)`.
+
+### 10.12 No **crash breadcrumb**
+
+Before a fatal error, log the last few operations. A ring buffer of 1000 lines would help post-crash analysis.
+
+### 10.13 `ReadGpuStrings` blocks on `glGetString` first time — see 9.3
+
+### 10.14 `PreloaderLogger` writes every line via `__android_log_print` — a syscall per line
+
+Under heavy logging, this is slow. Batch lines (write every 10 lines or 100ms). Or accept the cost (logcat is fast).
+
+---
+
+## 11. Input bridge
+
+### 11.1 `DispatchTextInput` copies per callback — see 2.6
+
+### 11.2 `DispatchKeyEvent` — each callback is invoked, all return values OR'd
+
+If a callback returns `true` (consumed), the event is still dispatched to all callbacks (not short-circuited). This means a menu that consumes Escape still lets the game see Escape (if the game checks a return value). Correct design (all get a chance), but document.
+
+For a "most advanced" preloader: add a `priority` to callbacks. High-priority callbacks run first, and if any returns `true`, lower-priority callbacks are skipped (opt-in via a "exclusive" flag).
+
+### 11.3 `DispatchTouch` — same
+
+### 11.4 `RequestDocument` — one slot, mutex
+
+Fine.
+
+### 11.5 `RegisterCppTouchCallback` — appends to `g_cppTouchCallbacks` with `CallbackSnapshot::add`
+
+`CallbackSnapshot::add` copies the whole vector (all existing callbacks) on each add. For 10 callbacks, that's 10 × vector copies (total 55 copies) at registration time. Fine.
+
+But `CallbackSnapshot` doesn't support removal by value (only `removeLast`). If a mod wants to unregister a specific callback, it can't. For "most advanced": add `remove(const T&)` by identity (using `std::function::target_type()` or requiring comparable callbacks).
+
+### 11.6 `InvokeSafely` — `OnceReport` per site. Good, but the `static OnceReport reported;` inside a template with a `const char* site` means **one report per template instantiation per site**? Actually, `InvokeSafely<Fn>` is templated on `Fn` (the lambda type), so each call site has a distinct `Fn` type → distinct `static OnceReport`. This is correct.
+
+But the `site` is a string, not part of the type — so two call sites with the same lambda type would share a `OnceReport`. Since lambdas have unique types, this doesn't happen in practice. Fine.
+
+### 11.7 `PreloaderInput_Interface` — fixed struct, no version field
+
+If a future version adds a field, mods built against the old struct would read garbage. Add a `uint32_t size` field (like the BerryAPI mirrors). This is a breaking ABI change but worth doing now.
+
+### 11.8 `pl::input::openDocument` — one callback at a time
+
+Correct (one picker at a time).
+
+### 11.9 `PLRequestDocument` — the C API wraps the C++ API
+
+Fine. But no user data lifetime guarantee — if the callback holds a pointer to `userData` after the call, and the caller freed it, that's the caller's bug. Document.
+
+---
+
+## 12. Resource-loader / AntEgg
+
+### 12.1 `AntEggLoader::ReadWholeFile` — see 2.16
+
+### 12.2 `AntEggLoader::Extract` — see 2.15
+
+### 12.3 `ParseCentralDirectory` — linear scan for EOCD (`for (size_t i = ...; i-- > search_start;)`) — fine
+
+But it doesn't handle the ZIP64 format (files > 4 GB or entries > 65,535). For a 512MB cap, ZIP64 isn't needed, but a mod could declare ZIP64 in its header while being small (valid) — the parser doesn't recognize it. Add a ZIP64 check and handle it.
+
+### 12.4 `ExtractEntryData` — inflates with zlib `inflateInit2(&stream, -MAX_WBITS)`
+
+`-MAX_WBITS` means **raw deflate** (no zlib header). ZIP uses raw deflate, so this is correct. Good.
+
+But: no `inflateGetDictionary` — for streams with a preset dictionary (rare in ZIP), the dictionary is ignored. Fine for normal ZIPs.
+
+### 12.5 `ExtractEntryData` — no **CRC32 check**
+
+`ExtractEntryData` inflates but doesn't verify the ZIP entry's CRC32. A corrupted entry could produce garbage. Add `crc32(0, data, size)` check.
+
+### 12.6 `AntEggLoader::Extract` — writes each file with `ofstream`, no fsync
+
+If the process crashes mid-extract, the staging dir is partial. The caller (via `AntEggLoader::LoadMod`) should clean up. But `fs::rename(stage, target)` at the end is atomic (on Linux), so a crash before rename leaves the old target intact. Good.
+
+But: the *staging dir* is `.modid.extracting` — if the process crashes, this dir leaks. Add a cleanup at startup (scan for `.extracting` dirs older than 1 day).
+
+### 12.7 `AntEggLoader::Extract` — no **atomic swap on the target**
+
+`fs::remove_all(target)` then `fs::rename(stage, target)` — between remove and rename, the target doesn't exist. If the process crashes, the mod is gone. Safer: rename target to `target.old`, rename stage to target, then remove `.old`. Add a recovery at startup (if `target.old` exists, restore it).
+
+### 12.8 `AntEggLoader::ParseManifest` — no schema version
+
+A future manifest format change can't be versioned. Add `"schema_version": 1` to the JSON and validate.
+
+### 12.9 `AntEggLoader::ValidateSandboxRoot` — good, but relies on `weakly_canonical` (resolves symlinks)
+
+If the sandbox root is a symlink to outside the app's private dir, `weakly_canonical` resolves it and the check passes (because the resolved path IS inside). But the *writes* go to the resolved path, which is fine. If the symlink is inside `/sdcard` (not private), the resolved path is `/sdcard/...` (not private) → check fails. Correct.
+
+But: a **race** — an attacker could swap a symlink between the check and the extract. Requires a hostile filesystem state, unlikely on Android. Document.
+
+### 12.10 `AntEggLoader` — no **permission enforcement**
+
+The `permissions` array is parsed but never used to restrict anything. For a "most advanced" preloader: enforce permissions (e.g. `filesystem.write` required for a mod to write files, `network` required for sockets). This needs a hook on `open`/`socket` (invasive) or documentation that permissions are advisory.
+
+---
+
+## 13. Pure modules (parsers, solvers, matrix, snapshot)
+
+### 13.1 `SignaturePattern::FindAllPatternMatches` — O(n*m) brute force
+
+Used in `SignaturePatternTest` (host) and by `Signature.cpp::PatternMatchesAt` (O(m) per candidate). Fine for the real scan (AC finds candidates first).
+
+But: `FindAllPatternMatches` is only used in tests — good.
+
+### 13.2 `PlayerSnapshot` — 8 retries, no backoff
+
+Under contention, a reader hammering the writer will hit the retry limit and return false. See 1.9.
+
+### 13.3 `SnapshotChannel::CopyWords` — byte-level when misaligned
+
+For an 8-byte-aligned buffer (the typical case), it does 8-byte atomic loads/stores. For a misaligned buffer, it does byte-level atomic loads/stores — which on ARM64 are `ldarb`/`stlrb` (still one instruction each, but 8× the instructions). For a 256-byte payload, that's 256 atomic ops instead of 32. Could align the buffer once (the payload is the caller's span, may not be aligned).
+
+**Fix:** copy the misaligned head/tail byte-wise, then the aligned middle word-wise. Currently `CopyWords` does exactly this — wait, re-read: `for (; i < n && !(wordAligned(dst + i) && wordAligned(s + i)); ++i) CopyByte(...)`. So it copies byte-by-byte until both dst and src are 8-aligned. Then does word-by-word. Then byte-by-byte for the tail. Good.
+
+But if `src` is never 8-aligned (e.g. payload is 3 bytes into a larger buffer), it does all bytes byte-wise. For a 256-byte payload, that's 256 atomic ops. Could copy to a local aligned buffer first (a stack buffer of 256 bytes), then atomic-copy word-wise. Trade one extra copy for 8× fewer atomic ops.
+
+Actually the payload here is published from the render thread — a stack local, then published. The buffer is the channel's `buffer_` (member `std::vector<uint8_t>`, heap-allocated, 8-aligned typically). So `dst` is 8-aligned. `src` is the payload pointer. If the payload is the render thread's stack buffer (8-aligned typically), both are aligned. Fine in practice.
+
+### 13.4 `Utf8::SanitizeToModifiedUtf8` — allocates a new string even when valid
+
+`if (IsValidModifiedUtf8(text)) return std::string(text);` — the copy is unavoidable for the return type. But for the common "ASCII path" (`text` is a literal), could return a `string_view` for the caller to keep. The current API returns `std::string`. Fine.
+
+### 13.5 `Utf8` — no **surrogate pair validation**
+
+Accept `0xED 0xA0 0xBD` (a high surrogate half) and `0xED 0xB8 0x80` (a low surrogate half) individually. But `NewStringUTF` expects them as a **pair** — a lone surrogate is invalid. The current validator accepts a lone high surrogate followed by a valid 3-byte sequence (which could be a non-surrogate). This is a JNI "illegal start byte" crash waiting to happen (not the 0x87 case, but a surrogate case).
+
+**Fix:** after accepting a 3-byte sequence that decodes to a surrogate, verify the *next* 3-byte sequence is the complementary surrogate. If not, reject the lone surrogate. Or replace it with U+FFFD.
+
+Actually, does `NewStringUTF` reject lone surrogates? The JNI spec says `NewStringUTF` reads modified UTF-8; a lone surrogate is technically not valid modified UTF-8 (surrogates must be paired). In practice, ART's behavior on a lone surrogate is... undefined. Add the check.
+
+### 13.6 `EngineAllocator` — `EngineAllocImpl` calls `::operator new` which can throw
+
+The function is `noexcept` and catches `(...)`. Good. But `EngineFreeImpl` calls `::operator delete` which is `noexcept` — fine.
+
+But: **thread safety**. `EngineAllocImpl` is called concurrently? It's not thread-safe as written because `operator new` is, but there's no per-allocator state. Fine.
+
+### 13.7 `FramePacing` — `kPercentileWindow = 2000`, array of atomics — 16 KB per analyzer
+
+For one analyzer, 16 KB. Fine. But: `reset()` re-initializes the whole 16 KB array — 2000 atomic stores. Called on session start. Fine.
+
+### 13.8 `FramePacing::percentiles()` — sorts 2000 elements with `std::sort` — ~100µs
+
+Called from `nativeReadFramePacingPercentiles`. See 2.3.
+
+### 13.9 `FramePacing` — `hitchesPerMinute` uses `percentileSpanUs_` which is the span of the **ring**, not the session — good (documented)
+
+But: `percentileSpanUs_` is set when a sample is written (`onFrame`), using `nowUs - oldestStamp`. If the writer stops (game paused), the span stays. When the writer resumes, the span jumps. This is fine for a window-based metric.
+
+### 13.10 `HookTiming` — compile-time `PRELOADER_HOOK_TIMING`, no runtime toggle
+
+For a "most advanced" preloader: also allow runtime toggle (`nativeSetHookTimingEnabled`). Requires converting the `constexpr` to a `bool` (or a `static atomic<bool>`). The current `if constexpr` in `HookRender` would need to become a runtime `if`.
+
+### 13.11 `ModLoadOrder` — DFS, cycle detection — correct
+
+But: no **max depth** — a chain of 10,000 mods would stack overflow. Cap at 1000 or convert to iterative.
+
+### 13.12 `ModFaultPolicy` — `int` counter, no overflow protection
+
+After 2^31 faults, wraps to negative — `DecideAfterFault` treats negative as "retry". Fine (bug becomes a no-op).
+
+### 13.13 `NativeModelMatrix::rotationAboutPivot` — two matrix multiplies per call
+
+`multiply(toPivot, multiply(rotation, fromPivot))` = 2 multiplies. For 20 bones, 40 multiplies per frame. Fine.
+
+But: `rotationAboutPivot` is called with `Vec3{0,0,0}` as pivot in many places (e.g. `NativeCosmeticData.cpp`), which means `toPivot = fromPivot = identity`. Optimize: `if (pivot == zero) return rotationX * rotationY * rotationZ;` — saves 2 multiplies.
+
+### 13.14 `NativeModelMatrix::multiply` — naive 4×4 multiply, no SIMD
+
+For 128 multiplies per call, and 40 calls/frame = 5120 multiplies. Negligible. But SIMD (NEON `vmlaq_f32`) would be 4× — nice-to-have.
+
+### 13.15 `BedrockModelParser::parse` — `std::stof` / `nlohmann::json` allocations
+
+For a 10 KB `.geo.json`, parses fine.
+
+But: **no size limit** — a 10 MB `.geo.json` is parsed. For a downloaded cosmetic, a malicious file could allocate heavily. Add a size cap (e.g. 1 MB) — the `AntEggLoader` has one (`kMaxBlobEntryBytes = 1 MiB`), but `NativeCosmeticData` also needs one.
+
+### 13.16 `BedrockModelParser` — no schema validation
+
+A model with 1,000,000 bones would parse into a million-element vector. Add caps: max 100 bones, max 100 cubes per bone, max 10,000 vertices total.
+
+### 13.17 `AntEggLoader::ParseManifest` — `nlohmann::json::parse(json, nullptr, true, true)` — the 4th arg is `allow_exceptions` = true
+
+`try/catch` handles the exception. Fine.
+
+### 13.18 `AntEggLoader::Extract` — no **case-insensitive** file system on Android (case-sensitive, fine)
+
+But ZIP entries are case-sensitive on some systems. If a package has `Egg.json` (capital E), the manifest search for `egg.json` fails. Handle case-insensitively (or document the requirement).
+
+### 13.19 `ProcessMemory::ParseSmapsRollupPss` — naive line scanning, fine
+
+But: PSS values in `smaps_rollup` are in kB. Correct.
+
+---
+
+## 14. Native API surface for mods
+
+### 14.1 No **C ABI version negotiation at mod load time**
+
+The preloader has `pl_get_abi_version()` (returns 1). But mods don't call it. A mod built against ABI 2 loaded into preloader ABI 1 would fail at the first symbol lookup. Add: on `dlopen`, call the mod's `PLMod_GetAbiVersion()` (if exported) and refuse if major/minor mismatch.
+
+### 14.2 `pl::memory::hook` — one signature, good
+
+But: no `pl::memory::hookChain` helper to install a chain of detours with explicit priority and owner. Add:
+```cpp
+struct HookSpec { FuncPtr target; FuncPtr detour; HookPriority priority; const char* name; };
+HookResult hookAll(std::span<const HookSpec>);
+```
+
+### 14.3 `pl::memory::Signature` — no **async** resolve
+
+`resolveSignatures` is synchronous. For a mod that resolves 20 signatures at load, that's ~1s (each 220MB scan is 50ms). Add `resolveSignaturesAsync(signatures, module, callback)` returning a `std::future`.
+
+### 14.4 `pl::render` — see 8.x
+
+### 14.5 `pl::mod` — `PL_REGISTER_MOD` macro, good
+
+But: no **mod-level error reporting** — if `load()` returns false, the mod is simply not loaded, and the log has a line. Add: the `PLModInfo` could include a `lastError` string pointer that the mod sets before returning false.
+
+### 14.6 `pl::modmenu` — registration API, good
+
+But: no **menu item priority** — all modules show in registration order. Add `ModuleInfo.priority` for sorting.
+
+### 14.7 `pl::input` — see 11.x
+
+### 14.8 `pl::Config` — typed config, good (uses `boost::pfr` for reflection)
+
+But: `serialize`/`deserialize` use `magic_enum` and `nlohmann`. For a "most advanced" preloader: add **validation** (the JSON schema is written, but not enforced on load). Add `ConfigFile<T>::validate()` that checks against the schema.
+
+### 14.9 `pl::platform::httpGet` — uses `HttpURLConnection` via JNI, slow — see 28
+
+Replace with a native HTTP client (e.g. `curl` or `libcurl` — but that's a new dependency) or improve the JNI path (connection pooling via `HttpURLConnection.setDefaultRequestProperty` + a persistent `CookieManager`). Or ship a minimal native HTTP/1.1 client (200 lines of code for GET-only).
+
+### 14.10 `pl::ModMenuConfig` — schema builder, good
+
+But: the schema is a string, not validated on the native side — see 14.8.
+
+### 14.11 `pl::Logger` — public logger, good
+
+But: no **structured logging** — a mod can't log `{key: value}`. Add `logJson(level, string_view json)`.
+
+### 14.12 `pl::Mod` — `NativeMod::current()` uses `thread_local` — good
+
+But: `getLogger()` returns a reference; if the logger was destroyed (impossible — process-wide), fine.
+
+### 14.13 `pl::memory::Patch` — good
+
+But: no `Patch::commit()`/`Patch::rollback()` batching — every `writeBytes` calls `mprotect` (one syscall per patch). For a mod that patches 100 sites at load, that's 100 syscalls. Add `Patch::batch()` that collects writes and does one `mprotect` per page.
+
+### 14.14 `pl::memory::Vtable` — no **vtable slot** for common game classes as a public API
+
+Mods must know the RTTI name and slot. Add named helpers: `resolveClientInstanceSlot31()`, `resolvePlayerRendererSlot17()`, etc.
+
+---
+
+## 15. Build, toolchain, packaging
+
+### 15.1 **No LTO**
+
+`CMakeLists.txt` has `-ffunction-sections` and `-Wl,--gc-sections` but not `-flto`. LTO typically gives 5–15% on a C++ codebase this size. Add `-flto` in Release, `-flto=thin` (clang) for faster links.
+
+### 15.2 **No PGO**
+
+For a "most advanced" preloader: ship a PGO profile generated from a benchmark or a real session, and use `-fprofile-use`. This gives another 5–10% on hot paths.
+
+### 15.3 **No BOLT** (post-link optimization)
+
+Clang BOLT reorders hot functions. Requires a profile. Advanced but doable.
+
+### 15.4 **No `-march=armv8.2-a+fp16+dotprod`**
+
+The default Android target is `armv8-a` (baseline). Modern ARM64 devices (2018+) support `armv8.2-a`. Using it could give SIMD improvements (dot product, fp16). But: reduces compatibility with older devices. Gate behind a **runtime CPU feature check** (`getauxval(AT_HWCAP)`) and ship two variants (ifunc-style, or two code paths with function pointers).
+
+### 15.5 **No `-fvisibility=hidden` on fetches**
+
+The preloader has `-fvisibility=hidden` on its own code, good. But fetched libs (fmt, nlohmann, lunasvg) don't. `-Wl,--exclude-libs,ALL` handles this (already done). Good.
+
+### 15.6 **No reproducible build**
+
+`-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.` is there (good). But the fetch commit hashes are pinned (good). Missing: `SOURCE_DATE_EPOCH`, `-fdebug-prefix-map`. Add.
+
+### 15.7 **Dependencies fetched from GitHub at configure time**
+
+This is a network dependency at build time. For a "most advanced" preloader: vendor the dependencies (as `lib/ARM64/libGlossHook.a` is already vendored). Or use a **lockfile** (`deps.lock`) with SHA256 and a local mirror fallback.
+
+### 15.8 **`lib/ARM64/libGlossHook.a` is a prebuilt binary**
+
+No source. This is fine for a legal reason (GlossHook may not be open-source-licensed permissively). But for a "most advanced" preloader: an audit of the binary (static analysis, symbol enumeration) is worth documenting.
+
+### 15.9 **No cross-compilation CI matrix**
+
+Only `arm64-v8a`. Add a CI job that builds `x86_64` (for emulator testing) and `armeabi-v7a` (if ever needed). This catches portability regressions.
+
+### 15.10 **No build cache**
+
+Add `ccache` or `sccache` in CI. 10× faster rebuilds.
+
+### 15.11 **No split APK / feature module**
+
+The preloader is a single `.so`. For a "most advanced" preloader: ship **optional modules** (e.g. `libpreloader-cosmetics.so`, `libpreloader-optifine.so`) as separate `.so`s, loaded on demand. Reduces startup time (only load what's used).
+
+### 15.12 **No `-Wshadow`, `-Wconversion`, `-Wsign-conversion`**
+
+The current warnings are `-Wall -Wextra`. Adding these catches subtle bugs. `-Wconversion` is noisy but worth it for numeric code.
+
+### 15.13 **No `-fsanitize=undefined` in debug builds**
+
+UBSan catches undefined behavior (shifts, overflows, misaligned reads). Add to a debug build type.
+
+### 15.14 **No `-fsanitize=hwaddress` (HWASan) target**
+
+HWASan is Android's memory safety sanitizer for ARM64. It catches use-after-free, buffer overflows. Worth a CI job on a device.
+
+### 15.15 **No `-fstack-protector-strong`**
+
+`-fstack-protector-strong` is not on by default in the Android NDK for all builds. Add.
+
+### 15.16 **No `-D_FORTIFY_SOURCE=2`**
+
+FORTIFY catches some buffer overflows in libc wrappers. Add.
+
+### 15.17 **No `-Wl,-z,relro,-z,now`**
+
+Full RELRO + BIND_NOW gives a small startup cost but prevents GOT overwrite. Add for release builds (defense in depth).
+
+### 15.18 **`-Wl,--pack-dyn-relocs=android`** — already done, good
+
+### 15.19 **`-Wl,-z,max-page-size=16384`** — already done, good
+
+---
+
+## 16. Testing & CI
+
+### 16.1 **No performance benchmarks**
+
+Every optimization listed above needs a before/after benchmark. Add:
+- **Scan benchmark**: scan a synthetic 220MB buffer for 20 signatures. Target: <100ms.
+- **Vtable resolve benchmark**: resolve a known slot 1000×. Target: <1ms after memo.
+- **Hook install benchmark**: install 100 hooks. Target: <10ms.
+- **Render callback benchmark**: dispatch 100 callbacks. Target: <10µs.
+
+### 16.2 **No fuzzing of the real parsers** (only the seeded generator)
+
+Add libFuzzer targets:
+- `fuzz_signature_pattern` — `ParseSignaturePattern`
+- `fuzz_manifest` — `AntEggLoader::ParseManifest`
+- `fuzz_geometry` — `BedrockGeometryParser::parse`
+- `fuzz_frame` — `ParseCosmeticFrameData`
+- `fuzz_zip` — `ParseCentralDirectory` (feed random bytes)
+- `fuzz_json` — all JSON parsers
+
+Run in CI on every commit (OSS-Fuzz style, 1000 iterations per target).
+
+### 16.3 **No ThreadSanitizer on the full test suite**
+
+Only `SnapshotChannelTsanTest` and `PlayerSnapshotTsanTest` run under TSAN. Add TSAN to all tests (there are 48; most are single-threaded but the multi-threaded ones would catch races like 1.1).
+
+### 16.4 **No AddressSanitizer**
+
+ASan catches use-after-free, buffer overflows. Add to all host tests (`-fsanitize=address`).
+
+### 16.5 **No integration test**
+
+All tests are unit tests. Add an integration test that:
+- Loads a mod `.so` (a test mod shipped in `tests/mods/`).
+- Calls `PLMod_Load`, `PLMod_Enable`.
+- Registers a menu module.
+- Registers a hook.
+- Verifies the hook fires.
+- Unloads.
+
+This exercises the whole mod lifecycle without a device.
+
+### 16.6 **No test for the JNI surface**
+
+Add a JNI test harness (using a host JVM with `-Xcheck:jni`). This catches `NewStringUTF` crashes (Utf8 module), local ref leaks, etc.
+
+### 16.7 **No device test harness**
+
+The docs repeatedly say "requires a device". Add a device test app that loads the preloader into a stub process and runs a suite of JNI calls. This catches device-specific issues (JNI attach, hook install).
+
+### 16.8 **No coverage tracking**
+
+Add `llvm-cov` to the build. Target: 80% line coverage on pure modules, 50% on Android-specific code.
+
+### 16.9 **No regression test for the camera scan**
+
+If 1.3 (strstr bug) is fixed, add a test that creates a synthetic `/proc/self/maps` and verifies the parser picks the right region.
+
+### 16.10 **`run_tests.sh` doesn't run in parallel**
+
+48 tests run sequentially. Each compiles and runs. Add `xargs -P$(nproc)`. 5–10× faster.
+
+### 16.11 **`run_tests.sh` uses `g++` by default**
+
+Allow `clang++` and `CXX=clang++`. Also add `-fsanitize=thread` and `-fsanitize=address` variants.
+
+### 16.12 **No test for `ModFaultTracker`**
+
+`ModFaultPolicyTest` covers the pure rule, but `ModFaultTracker` (the class with the map) isn't tested for concurrent access. Add a TSAN test.
+
+### 16.13 **No test for `FeatureAvailability` under concurrent set/read**
+
+Add.
+
+### 16.14 **No test for `CallbackSnapshot` under concurrent add/forEach**
+
+Add.
+
+### 16.15 **No test for `CallbackSnapshot` with a `std::function` that captures a large object**
+
+Small allocation semantics.
+
+### 16.16 **No test for `ImageOverrideRegistry` with 1000 entries**
+
+Binary search + `hasSourceSize` (linear) — verify `hasSourceSize` is O(n) not O(1). Add a test with 1000 entries and measure.
+
+### 16.17 **No test for `EngineAllocator` with `alignment > 64`**
+
+Test 128, 256, 4096.
+
+### 16.18 **No test for `Utf8` with a lone surrogate**
+
+Add (see 13.5).
+
+### 16.19 **No test for `AntEggLoader` with a 100-entry ZIP**
+
+Add.
+
+### 16.20 **No test for `AntEggLoader` with a ZIP64 archive**
+
+Add.
+
+---
+
+## 17. Security & isolation
+
+### 17.1 **No signature verification on mods** — see 6.3
+
+### 17.2 **No seccomp / sandbox for mods**
+
+A mod runs in the game process. It can `ptrace`, `ioctl`, `mmap` anywhere, `execve`, `socket`, etc. For a "most advanced" preloader:
+1. Install a seccomp-bpf filter that **allows** common operations (read, write, mmap, mprotect, futex, open on `/data/user/0/<pkg>/...`) and **logs** (or blocks) everything else.
+2. Expose the blocked syscalls via `nativeGetBlockedSyscalls()`.
+3. This is hard because mods legitimately need most syscalls. A "log-only" filter is achievable in a day.
+
+### 17.3 **No protection against hooking the preloader itself**
+
+A mod could `dladdr` the preloader, find `pl::memory::hook`, and hook it to bypass the preloader's security checks (once added). For a "most advanced" preloader: sign the preloader's own `.text` and verify on a periodic timer.
+
+### 17.4 **No anti-debugging** (some anti-cheat clients want this; others hate it)
+
+Not recommended for an open-source project. Skip.
+
+### 17.5 **No permission enforcement** — see 12.10
+
+### 17.6 **No rate-limiting on JNI calls**
+
+A malicious UI process (unlikely, same process) or a misbehaving mod (via the C++ API) could call `nativeLoadMod` in a loop. Not a real threat since everything is same-process, but a rate limit prevents accidental DoS.
+
+### 17.7 **No validation of `SkinRef` pointer before write** — see 7.11
+
+### 17.8 **`pl::memory::writeBytes` doesn't verify the target is in the game module**
+
+A mod could patch arbitrary memory. That's the point of the API (it's a mod loader), but a **confirmation** (e.g. "the target is in `libminecraftpe.so`" or "in an executable mapping") would prevent accidental patches. Currently `hasReadableMappedRange` checks readable, `setMemRWX` makes it RWX, then writes. It should at least check the mapping is **writable-or-mapped-by-the-game**.
+
+### 17.9 **`pl::memory::hook` refuses targets that aren't in an executable mapping** — good
+
+But it doesn't refuse targets in the **preloader's own** code (which would allow a mod to hook the preloader). Add: refuse if the target is in `libpreloader.so`.
+
+---
+
+## 18. Observability & crash reporting
+
+### 18.1 **No crash handler**
+
+The preloader has no `SIGSEGV`/`SIGABRT` handler. A crash in a hook or a mod kills the game with a generic logcat entry. For a "most advanced" preloader:
+1. Install a `sigaction` handler for `SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGABRT`.
+2. On crash, dump: register state, backtrace (via `unwind` or a simple frame-pointer walk), the last 1000 log lines (from 10.10), and the current mod context (`NativeMod::current()`).
+3. Write to a crash file (`/data/user/0/<pkg>/preloader-crash-<timestamp>.json`).
+4. The launcher reads and uploads the crash report on next launch.
+
+This is the single biggest improvement for support quality.
+
+### 18.2 **No breadcrumb ring buffer** — see 10.12
+
+### 18.3 **No "last known state" snapshot on crash**
+
+Before the crash handler, cache the last N hook invocations and mod calls. Dump on crash.
+
+### 18.4 **No `minidump` generation**
+
+For ARM64, `minidump` (as used by Breakpad/Crashpad) is complex but gives full stack traces. Consider `libcrashpad` if a native crash handler is out of scope.
+
+### 18.5 **No telemetry opt-in**
+
+Crash reports + performance metrics (frame pacing p50/p99, hook timing) could be uploaded with user consent. This is a policy decision, but the infrastructure (local file + launcher upload) is worth having.
+
+### 18.6 **No live diagnostics endpoint**
+
+For a "most advanced" preloader: expose a **local socket** that the launcher (or a dev tool) can connect to for live diagnostics: hook counts, frame pacing, memory, feature availability, the last N log lines. This is a `AF_UNIX` socket in the app's private dir, accessible only to the launcher. Huge for debugging without `adb logcat`.
+
+### 18.7 **No perfetto / atrace integration**
+
+Android's `atrace` lets tools visualize slices. Emit slices around hook installs, mod loads, signature scans. Gives a system-wide view of preloader overhead.
+
+### 18.8 **No `trace_marker` support**
+
+Write to `/sys/kernel/debug/tracing/trace_marker` (if accessible) to correlate with `atrace` from other processes. Gated on developer options.
+
+### 18.9 **`nativeReadProcessMemory`** — see 9.4
+
+### 18.10 **No per-hook latency tracking**
+
+Each hook could measure how long it takes to run (with a `rdtsc` around the detour body). Expose via `nativeReadHookLatencies()`. For mods, this is invaluable ("your hook adds 5ms to every frame").
+
+### 18.11 **No thread-level CPU usage**
+
+Read `/proc/self/task/<tid>/stat` for CPU time. Show per-hook thread usage.
+
+---
+
+## 19. New capabilities (roadmap)
+
+Beyond fixes, these would make the preloader the *most advanced*:
+
+### 19.1 **Hot reload of mods** — see 6.1
+
+### 19.2 **Mesh renderer for hats/pets** — see 7.13
+
+### 19.3 **In-game mod manager UI hooks**
+
+The current mod menu is in-game, but loading/unloading mods requires a launcher restart. Add JNI: `nativeUnloadMod(id)`, `nativeReloadMod(id)`, `nativeReloadAllMods()`. Then the in-game mod menu can unload/enable mods live.
+
+### 19.4 **Mod repository**
+
+A launcher-side mod browser + installer that uses `AntEggLoader`. Already partially there (`.antegg` format). Add a **native** update check (`nativeCheckModUpdates(url)`).
+
+### 19.5 **Script mods (Lua/JS)**
+
+`AntEggManifest` supports `type: "script"` with `.lua` entry points, but there's no Lua runtime. Embed Lua 5.4 (`lua-5.4.x` is ~20k LOC, compiles to ~200KB `.so`). Expose the C++ API to Lua (via sol2 or a hand-rolled binding). This makes mods writable in minutes instead of days — huge ergonomic win.
+
+### 19.6 **WASM mods**
+
+For a "most advanced" preloader: embed Wasmtime or Wasm3 (~100KB) and load mods as `.wasm`. Sandboxed by design (no syscalls unless imported). Mods can be written in Rust/Go/C++ and compiled to WASM. This is the future of safe modding.
+
+### 19.7 **Telemetry for hook health**
+
+For each hook, track: install count, call count, average latency, error count. Report to the launcher. Catches bad signatures before users complain.
+
+### 19.8 **Per-mod menu API v2**
+
+The current menu API (`ModuleInfo` + `ConfigEntry`) is functional but limited (8 config types). For a "most advanced" preloader: a **declarative UI** (JSON schema, already there in `ConfigSchemaBuilder` v2) + a **native widget rendering** (currently the launcher draws). Moving the draw to native means the menu can render without a launcher round-trip — 1 frame faster.
+
+### 19.9 **Network sync for cosmetics** — already implemented
+
+### 19.10 **Replay system** — already implemented (BerryAPI)
+
+### 19.11 **Frame profiler**
+
+A native `atrace`-style profiler for the preloader's own code: hook dispatch, scan, mod load, render callback. Expose via JNI. Invaluable for diagnosing "why is my game slow".
+
+### 19.12 **Live signature scan progress**
+
+For a build where the scan is slow, show progress (percent + current pattern) in the launcher splash. Add `nativeGetScanProgress()`.
+
+### 19.13 **Offline signature generation**
+
+The `tools/gen_rules.py` is offline. For a "most advanced" preloader: a **native** rule generator that runs on-device (parse the `.so` from `/proc/self/maps` + the file, apply relocations, find slots). Removes the launcher round-trip.
+
+### 19.14 **Mod signing infrastructure**
+
+See 6.3.
+
+### 19.15 **Bedrock version auto-detect**
+
+The launcher passes the version to `nativeConfigureSignatureRules`. For "most advanced": also detect from the `.so` (string scan for version strings) and verify the launcher's version matches — catches a stale launcher.
+
+### 19.16 **Hook dependency graph**
+
+Given a set of installed hooks, build a dependency graph (who hooks whom) and detect cycles. Useful for debugging.
+
+### 19.17 **Reproducible rules**
+
+`tools/gen_rules.py` generates a rule from an APK. For "most advanced": sign the rule with the preloader's key, verify on load. Prevents a malicious rule file (if the rules are downloaded) from installing arbitrary hooks.
+
+### 19.18 **Player-facing performance dashboard**
+
+The launcher currently polls ~10 JNI calls for the diagnostics page. Add a single `nativeGetFullDiagnostics()` returning a JSON blob with everything (feature availability, hook stats, frame pacing, memory, GPU, mods, logs). One call instead of 10.
+
+### 19.19 **Cross-session profiling**
+
+Save frame-pacing stats to disk on session end. Compare across sessions. Detect regressions.
+
+### 19.20 **Mod marketplace integration**
+
+For a "most advanced" loader: hook into the launcher's mod marketplace so a user can browse/install/update mods without leaving the game.
+
+---
+
+## 20. Priority matrix
+
+| # | Item | Effort | Impact | Category |
+|---|------|--------|--------|----------|
+| 1.1 | Fix `g_framePublished` data race | S | **Critical** | Correctness |
+| 1.3 | Fix `strstr` in Camera/CosmeticContext | S | **High** | Correctness |
+| 1.4 | Move camera scan off frame thread | M | **High** | Correctness |
+| 1.5 | Fix 2MB JNI allocation | M | **High** | Perf |
+| 1.7 | Cache rules file parsing | S | **High** | Perf |
+| 1.9 | Snapshot read: `ReadResult` enum | S | Medium | Correctness |
+| 2.1 | Single `clock_gettime` in render hook | S | **High** | Perf |
+| 2.2 | Dispatch render callbacks once per frame | S | **High** | Perf |
+| 2.3 | Cache `percentiles()` | S | Medium | Perf |
+| 2.8 | Compile out INFO in release | S | Medium | Perf |
+| 2.9 | Make hook self-test opt-in | S | Medium | Perf |
+| 2.18 | Index keybinds by keyCode | M | **High** | Perf |
+| 2.19 | Cache draw commands by revision | M | **High** | Perf |
+| 3.4 | Per-registry locks or lock-free | M | **High** | Perf |
+| 4.1 | Parallel signature scan | L | **High** | Perf |
+| 4.2 | Improve masked pattern scan | M | Medium | Perf |
+| 4.3 | Batch `process_vm_readv` | S | Medium | Perf |
+| 4.10 | SIMD type-name search | S | **High** | Perf |
+| 4.11 | Relocation index for `.data.rel.ro` | L | **High** | Perf |
+| 4.12 | Memoize `resolveVtableSlotReferencingString` | S | **High** | Perf |
+| 4.14 | Cache `GlossGetLibSection` | S | Medium | Perf |
+| 5.4 | Verify patched prologue matches original | S | Medium | Correctness |
+| 5.5 | Verify full LDR/BR pair | S | Medium | Correctness |
+| 5.12 | Tag hooks with owner for hot reload | M | **High** | Capability |
+| 6.1 | Hot reload of mods | L | **Very High** | Capability |
+| 6.2 | Parallel mod loading | M | **High** | Perf |
+| 6.3 | Signature verification on mods | L | **Very High** | Security |
+| 6.5 | Persist mod faults across sessions | S | Medium | Correctness |
+| 6.6 | `RTLD_LOCAL` by default | S | Medium | Security |
+| 6.17 | Mod load returns error string | S | Medium | UX |
+| 7.5 | Fix `ReadMceImageHookDiagnostics` dup | S | Low | Correctness |
+| 7.6 | Fix shift UB in `ReadCapeCaptureDiagnostics` | S | **Critical** | Correctness |
+| 7.11 | Verify `SkinRef` before writing | S | Medium | Security |
+| 7.14 | Precompute rotation matrices in parser | S | Medium | Perf |
+| 7.17 | Binary search in `AnimationSolver::sample` | S | Medium | Perf |
+| 8.5 | Use actual aspect ratio | S | Medium | Correctness |
+| 9.4 | Cache `/proc` reads with TTL | S | **High** | Perf |
+| 9.15 | Overflow checks in JNI setters | S | Medium | Security |
+| 10.10 | In-memory log ring buffer | M | **High** | Observability |
+| 10.11 | `nativeSetLogLevel` | S | Medium | Observability |
+| 11.7 | Add `size` field to `PreloaderInput_Interface` | S | Medium | ABI |
+| 12.1 | mmap for AntEgg | M | Medium | Perf |
+| 12.5 | CRC32 check on extract | S | Medium | Correctness |
+| 12.7 | Atomic swap on extract target | S | Medium | Correctness |
+| 13.5 | Surrogate pair validation | S | Medium | Correctness |
+| 14.1 | ABI negotiation at mod load | M | **High** | ABI |
+| 14.3 | Async signature resolve | M | Medium | Capability |
+| 15.1 | LTO | S | **High** | Perf |
+| 15.2 | PGO | M | **High** | Perf |
+| 15.4 | `armv8.2-a` with runtime check | L | Medium | Perf |
+| 16.1 | Benchmarks | M | **High** | Testing |
+| 16.2 | Fuzzing | M | **High** | Testing |
+| 16.3 | TSAN on all tests | S | **High** | Testing |
+| 16.4 | ASAN on all tests | S | **High** | Testing |
+| 16.5 | Integration test | M | **High** | Testing |
+| 17.2 | seccomp-bpf for mods | L | Medium | Security |
+| 18.1 | Crash handler + breadcrumb | L | **Very High** | Observability |
+| 18.6 | Live diagnostics socket | M | **High** | Observability |
+| 18.7 | atrace integration | S | Medium | Observability |
+| 19.5 | Lua scripting | L | **Very High** | Capability |
+| 19.6 | WASM mods | XL | High | Capability |
+
+**S = <1 day, M = 1–3 days, L = 3–10 days, XL = >10 days.**
+
+---
+
+## Final note
+
+The code you have is **genuinely good** — the design choices (fail-closed everywhere, host-testable pure modules, register-aware passthroughs, probe-backed rules) are those of a **mature** hooking framework. What it's missing is:
+
+1. **Fixing the handful of real bugs** (data race, shift UB, `strstr`, big JNI allocations).
+2. **Moving the expensive work off the hot path** (camera scan, percentiles, JNI polling).
+3. **Making the mod loader a first-class citizen** (hot reload, parallel load, signature verification, fault persistence, error reporting).
+4. **Adding the observability layer** (crash handler, log ring buffer, live socket) that turns "it crashed" into "here's the backtrace + the last 20 mod actions".
+5. **Making it feel fast** (LTO, PGO, benchmarks, TSAN/ASAN in CI so regressions are caught).
+
+Items 1–2 are ~2 weeks of focused work and would double the perceived smoothness. Items 3–4 are another ~4 weeks and would make the mod loader feel like a real platform. Items 5–19 are a longer roadmap — the point is that the foundation supports them; none of the improvements here require a rewrite.
+
+The single highest-leverage fix, given what users actually complain about ("laggy, unstable, weak mod loader"), is the combination of **1.1 (data race)**, **1.4 (camera scan stall)**, **1.5 (JNI allocations)**, **2.18 (keybind scan)**, **6.1 (hot reload)**, and **18.1 (crash handler)**. Those six alone would change the product from "advanced but janky" to "the smoothest preloader anyone has built".
